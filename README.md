@@ -29,7 +29,8 @@ pip install curl_cffi
   "enable_oauth": true,
   "oauth_redirect_uri": "http://localhost:1455/auth/callback",
   "ak_file": "ak.txt",
-  "rk_file": "rk.txt"
+  "rk_file": "rk.txt",
+  "max_workers": 3
 }
 ```
 
@@ -42,6 +43,7 @@ pip install curl_cffi
 | enable_oauth | 启用 OAuth 登录 |
 | ak_file | Access Key 文件 |
 | rk_file | Refresh Key 文件 |
+| max_workers | 非交互模式默认并发数 |
 
 ## CPA 面板集成
 
@@ -57,8 +59,10 @@ pip install curl_cffi
 ## 使用
 
 ```bash
-python chatgpt_register.py
+python3 chatgpt_register.py
 ```
+
+如果你的环境存在 `python` 命令，也可以继续使用 `python chatgpt_register.py`。
 
 ## 输出
 

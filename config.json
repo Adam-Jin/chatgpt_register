@@ -1,10 +1,10 @@
 {
   "_comment": "ChatGPT(DuckMail)",
 
-  "total_accounts": 5,
+  "total_accounts": 1000,
 
   "duckmail_api_base": "https://api.duckmail.sbs",
-  "duckmail_bearer": "",
+  "duckmail_bearer": "pZM65bD5wxhHkiL",
 
   "proxy": "",
 
@@ -18,5 +18,14 @@
   "rk_file": "rk.txt",
   "token_json_dir": "codex_tokens",
   "upload_api_url": "http://localhost:8317/v0/management/auth-files",
-  "upload_api_token": "你的cpa面板登录密码"
+  "upload_api_token": "你的cpa面板登录密码",
+
+  "sentinel_solver_url": "http://127.0.0.1:5732",
+
+  "herosms_api_key": "d90Ab6d6b7367fe5f4f55f31Add39fA0",
+  "herosms_country": 52,
+  "herosms_service": "dr",
+  "herosms_max_price": 0.0589,
+
+  "quackr_refresh_token": "AMf-vBxzdVLHG9GzLXuG8EhmMvL_bUZg4PjH5UZbS4-uJzfBuZbtCLFzZ1RuSmBFDeM5YbgzLKqoQl_gTglco3bVBU6wjTec5WePwzjY89HN4n03MWP1HTMnnXD7PQgUP-yZzq5mEcI9uMiY4hBtDBKLZJRU4qrpGralv9fzJbnKbD1KwvBQ8seksFZff0lTJyXzfODQHGb9ftGhzC_neAoXF5rXADAFm_yiskpKkjHTB9C1eTliyHZew0e0IqQLJpOGmN7AxfuOHCHklKxLgMD5cPvocj3xqHFEU4ziEddHni0f9SCiDqneGJWI0RU3mjJPFJ_D-R6ddM5OGFC7E2_mKhgpoSmosCU8tUBxtSLcNEn1cPoJl6YkijmXxITQxa3cCFOHJ91muR2qCi7CFmXcKD3BBldhv7z2CDCOGLO1HwbVzZmDOLQ"
 }
