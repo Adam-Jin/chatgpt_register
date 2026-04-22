@@ -32,6 +32,10 @@ from sms_provider import (
     AcquireFailed, NoNumberAvailable, SmsProvider, SmsProviderError, SmsSession,
 )
 
+
+class ActivationInactive(SmsProviderError):
+    """activation 已 finish/cancel/expired (HTTP 409). 号 dead, 不要再 cancel/finish。"""
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "config.json")
 HEROSMS_API = "https://hero-sms.com/stubs/handler_api.php"
@@ -92,11 +96,18 @@ def get_balance(api_key: str) -> float:
     raise SmsProviderError(f"getBalance unexpected body: {body!r}")
 
 
-def get_prices(api_key: str, service: str, country: int) -> dict:
-    """返回原始报价 dict (key 是运营商 code, value={cost,count,physicalCount})。"""
-    status, body = _call(api_key, {
-        "action": "getPrices", "service": service, "country": country,
-    })
+def get_prices(api_key: str, service: Optional[str] = None,
+               country: Optional[int] = None) -> dict:
+    """返回嵌套 dict: {country_id: {service_code: {cost,count,physicalCount}}}.
+
+    service/country 都可省略, 省略时返回该维度的全量。
+    """
+    params: dict = {"action": "getPrices"}
+    if service:
+        params["service"] = service
+    if country is not None:
+        params["country"] = country
+    status, body = _call(api_key, params)
     if status != 200:
         raise SmsProviderError(f"getPrices HTTP {status}: {body!r}")
     if isinstance(body, list) and body and isinstance(body[0], dict):
@@ -107,18 +118,21 @@ def get_prices(api_key: str, service: str, country: int) -> dict:
 
 
 def cheapest_price(prices: dict) -> Optional[tuple[str, float, int]]:
-    """从 getPrices 返回里挑最便宜且有库存的。返回 (operator, cost, count)。"""
+    """从嵌套 getPrices 返回挑最便宜且有库存的。返回 ("country/service", cost, count)。"""
     best: Optional[tuple[str, float, int]] = None
-    for op, info in (prices or {}).items():
-        if not isinstance(info, dict):
+    for c_id, svcs in (prices or {}).items():
+        if not isinstance(svcs, dict):
             continue
-        cost = info.get("cost")
-        count = info.get("count") or info.get("physicalCount") or 0
-        if cost is None or count <= 0:
-            continue
-        c = float(cost)
-        if best is None or c < best[1]:
-            best = (op, c, int(count))
+        for svc_code, info in svcs.items():
+            if not isinstance(info, dict):
+                continue
+            cost = info.get("cost")
+            count = info.get("count") or info.get("physicalCount") or 0
+            if cost is None or count <= 0:
+                continue
+            c = float(cost)
+            if best is None or c < best[1]:
+                best = (f"{c_id}/{svc_code}", c, int(count))
     return best
 
 
@@ -206,6 +220,29 @@ def get_status_v2(api_key: str, activation_id: str) -> Optional[dict]:
     raise SmsProviderError(f"getStatusV2 unexpected: {body!r}")
 
 
+def get_all_sms(api_key: str, activation_id: str, *,
+                size: int = 20, page: int = 1) -> list[dict]:
+    """拉某 activation 上的全部 SMS (按 SMS id 去重靠这个).
+
+    409 → ActivationInactive (号已 finish/cancel/expired).
+    返回 data[] 数组, 每条含 {id, code, text, date, phoneFrom, service, type}。
+    """
+    status, body = _call(api_key, {
+        "action": "getAllSms", "id": activation_id, "size": size, "page": page,
+    })
+    if status == 409:
+        raise ActivationInactive(f"getAllSms 409: {body!r}")
+    if status == 404:
+        raise ActivationInactive(f"getAllSms 404 (not found): {body!r}")
+    if status != 200:
+        raise SmsProviderError(f"getAllSms HTTP {status}: {body!r}")
+    if isinstance(body, dict) and "data" in body:
+        return body["data"] or []
+    if isinstance(body, list):
+        return body
+    raise SmsProviderError(f"getAllSms unexpected: {body!r}")
+
+
 def set_status(api_key: str, activation_id: str, status_code: int) -> str:
     """1=已发, 3=请求重发, 6=完成, 8=取消。"""
     status, body = _call(api_key, {"action": "setStatus",
@@ -234,12 +271,30 @@ def finish_activation(api_key: str, activation_id: str) -> None:
 
 def get_active_activations(api_key: str, start: int = 0,
                            limit: int = 100) -> list[dict]:
+    """拉账号下还未结算的 activation 列表.
+
+    实际响应是嵌套结构 (与文档不一致):
+      {"activeActivations": {"affected_rows": N, "row": {...}, "rows": [...]}}
+    每条 rows 含: activationId, phoneNumber, serviceCode, activationStatus,
+    activationTime, activationCost, smsCode, smsText, estDate (到期时间),
+    receiveSmsDate, finishDate, ...
+    """
     status, body = _call(api_key, {"action": "getActiveActivations",
                                    "start": start, "limit": limit})
     if status != 200:
         raise SmsProviderError(f"getActiveActivations HTTP {status}: {body!r}")
-    if isinstance(body, dict) and "activeActivations" in body:
-        return body["activeActivations"]
+    if not isinstance(body, dict):
+        return []
+    inner = body.get("activeActivations")
+    # 形状 1: 嵌套 dict 含 rows[]
+    if isinstance(inner, dict):
+        rows = inner.get("rows")
+        if isinstance(rows, list):
+            return rows
+        return []
+    # 形状 2: 文档里写的直接是 list
+    if isinstance(inner, list):
+        return inner
     return []
 
 
@@ -316,40 +371,94 @@ class HeroSmsProvider(SmsProvider):
     def wait_otp(self, session: SmsSession, *,
                  regex: str = r"\b(\d{4,8})\b", timeout: int = 120,
                  poll_interval: int = 5,
-                 log: Callable[[str], None] = print) -> Optional[str]:
+                 log: Callable[[str], None] = print,
+                 since_sms_ids: Optional[set] = None,
+                 on_lease_lost: Optional[Callable[[], bool]] = None,
+                 ) -> Optional[str]:
+        """轮询 OTP. 复用号场景必须传 since_sms_ids 排除历史 SMS。
+
+        Returns:
+            code 字符串, 收不到/过期/租约丢失返回 None。
+            如需配套拿到 sms_id, 用 wait_otp_with_id。
+
+        on_lease_lost: 每次 poll 调一次, 返回 True 表示租约丢了立刻退出。
+        """
+        result = self.wait_otp_with_id(
+            session, regex=regex, timeout=timeout, poll_interval=poll_interval,
+            log=log, since_sms_ids=since_sms_ids, on_lease_lost=on_lease_lost,
+        )
+        return result[0] if result else None
+
+    def wait_otp_with_id(
+        self, session: SmsSession, *,
+        regex: str = r"\b(\d{4,8})\b", timeout: int = 120,
+        poll_interval: int = 5,
+        log: Callable[[str], None] = print,
+        since_sms_ids: Optional[set] = None,
+        on_lease_lost: Optional[Callable[[], bool]] = None,
+    ) -> Optional[tuple]:
+        """同 wait_otp 但返回 (code, sms_id) 用于 phone_pool 去重。
+
+        ActivationInactive → 立刻 None (号 dead).
+        """
         pat = re.compile(regex)
+        seen = set(since_sms_ids or ())
         deadline = time.time() + timeout
-        # 第一次 poll 前可选地告知服务"号已就绪等收码" (sms-activate 习惯)
+        # 通知服务"号已就绪等收码"
         try:
             set_status(self.api_key, session.handle, 1)
         except Exception as e:
             log(f"[herosms] setStatus=1 failed (non-fatal): {e}")
+
         while time.time() < deadline:
+            if on_lease_lost and on_lease_lost():
+                log(f"[herosms] {session.handle} lease lost, abort wait_otp")
+                return None
             try:
-                st = get_status_v2(self.api_key, session.handle)
+                msgs = get_all_sms(self.api_key, session.handle,
+                                    size=20, page=1)
+            except ActivationInactive as e:
+                log(f"[herosms] {session.handle} inactive: {e}")
+                return None
             except SmsProviderError as e:
-                log(f"[herosms] getStatusV2 error: {e}")
+                log(f"[herosms] getAllSms error: {e}")
                 time.sleep(poll_interval)
                 continue
-            if st is None:
-                log(f"[herosms] {session.handle} STATUS_WAIT_CODE")
+
+            new_msgs = [m for m in msgs if str(m.get("id")) not in seen]
+            if not new_msgs:
+                log(f"[herosms] {session.handle} WAIT_CODE "
+                    f"(seen {len(msgs)} msgs, all old)")
                 time.sleep(poll_interval)
                 continue
-            sms = (st or {}).get("sms") or {}
-            text = sms.get("text") or ""
-            code_field = sms.get("code") or ""
-            log(f"[herosms] sms.text={text!r} sms.code={code_field!r}")
-            for src in (code_field, text):
-                if not src:
-                    continue
-                m = pat.search(str(src))
-                if m:
-                    return m.group(1) if m.groups() else m.group(0)
+
+            # 取最新一条 (按 date 排序, 字符串 ISO 8601 直接比)
+            new_msgs.sort(key=lambda m: m.get("date") or "", reverse=True)
+            for m in new_msgs:
+                sms_id = str(m.get("id") or "")
+                code_field = m.get("code") or ""
+                text = m.get("text") or ""
+                log(f"[herosms] new sms id={sms_id} code={code_field!r} "
+                    f"text={text!r}")
+                for src in (code_field, text):
+                    if not src:
+                        continue
+                    pm = pat.search(str(src))
+                    if pm:
+                        code = pm.group(1) if pm.groups() else pm.group(0)
+                        return code, sms_id
+                seen.add(sms_id)  # 新 SMS 但抠不出码, 标记已看过避免下轮重复
             time.sleep(poll_interval)
         return None
 
     def release_ok(self, session: SmsSession) -> None:
-        finish_activation(self.api_key, session.handle)
+        try:
+            finish_activation(self.api_key, session.handle)
+        except SmsProviderError as e:
+            # 已经 inactive (例如号池已自己 finish 过) → 吞掉
+            if "409" in str(e) or "404" in str(e):
+                return
+            raise
 
     def release_no_sms(self, session: SmsSession) -> None:
         try:
@@ -406,24 +515,46 @@ def cmd_balance(args, cfg):
 def cmd_prices(args, cfg):
     api_key = cfg.get("herosms_api_key") or os.environ.get("HEROSMS_API_KEY")
     service = args.service or cfg.get("herosms_service", DEFAULT_SERVICE)
-    country = args.country or int(cfg.get("herosms_country", DEFAULT_COUNTRY))
+    if args.all:
+        country: Optional[int] = None
+    elif args.country is not None:
+        country = args.country
+    else:
+        country = int(cfg.get("herosms_country", DEFAULT_COUNTRY))
     prices = get_prices(api_key, service, country)
     if args.json:
         print(json.dumps(prices, ensure_ascii=False, indent=2))
         return
-    print(f"# service={service} country={country}")
-    print(f"{'operator':<14} {'cost':>8} {'count':>8} {'physical':>10}")
-    rows = sorted(
-        ((op, info) for op, info in prices.items() if isinstance(info, dict)),
-        key=lambda kv: float(kv[1].get("cost") or 99))
-    for op, info in rows:
-        print(f"{op:<14} {float(info.get('cost') or 0):>8.4f} "
-              f"{int(info.get('count') or 0):>8} "
-              f"{int(info.get('physicalCount') or 0):>10}")
+
+    # 把嵌套 {country: {service: info}} 拍平
+    rows: list[tuple[str, str, float, int, int]] = []
+    for c_id, svcs in prices.items():
+        if not isinstance(svcs, dict):
+            continue
+        for svc_code, info in svcs.items():
+            if not isinstance(info, dict):
+                continue
+            rows.append((
+                str(c_id), str(svc_code),
+                float(info.get("cost") or 0),
+                int(info.get("count") or 0),
+                int(info.get("physicalCount") or 0),
+            ))
+    # 仅显示有库存的; 无库存的算入但排在底部 (count desc 优先)
+    rows.sort(key=lambda r: (-(1 if (r[3] or r[4]) else 0), r[2], -r[3]))
+
+    print(f"# service={service or 'ALL'} "
+          f"country={country if country is not None else 'ALL'}")
+    print(f"{'country':<8} {'service':<8} {'cost':>8} {'count':>8} {'physical':>10}")
+    for c_id, svc, cost, cnt, phys in rows:
+        print(f"{c_id:<8} {svc:<8} {cost:>8.4f} {cnt:>8} {phys:>10}")
+    if not rows:
+        print("(no prices)")
+
     best = cheapest_price(prices)
     if best:
-        op, cost, cnt = best
-        print(f"\n# cheapest: ${cost:.4f}  operator={op}  count={cnt}")
+        tag, cost, cnt = best
+        print(f"\n# cheapest in-stock: ${cost:.4f}  ({tag})  count={cnt}")
     max_price = (args.max_price if args.max_price is not None
                  else float(cfg.get("herosms_max_price", DEFAULT_MAX_PRICE)))
     if best and best[1] > max_price:
@@ -479,6 +610,24 @@ def cmd_finish(args, cfg):
     print("ok")
 
 
+def cmd_all_sms(args, cfg):
+    api_key = cfg.get("herosms_api_key") or os.environ.get("HEROSMS_API_KEY")
+    msgs = get_all_sms(api_key, args.id, size=args.size, page=args.page)
+    if args.json:
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        return
+    if not msgs:
+        print("(no sms)")
+        return
+    print(f"{'sms_id':<14} {'date':<25} {'from':<14} {'code':<10} text")
+    for m in msgs:
+        print(f"{str(m.get('id','')):<14} "
+              f"{m.get('date',''):<25} "
+              f"{(m.get('phoneFrom','') or '')[:13]:<14} "
+              f"{(m.get('code','') or '')[:10]:<10} "
+              f"{(m.get('text','') or '')[:80]}")
+
+
 def cmd_active(args, cfg):
     api_key = cfg.get("herosms_api_key") or os.environ.get("HEROSMS_API_KEY")
     rows = get_active_activations(api_key)
@@ -509,8 +658,10 @@ def main():
     sub.add_parser("balance", help="余额")
 
     p = sub.add_parser("prices", help="当前 service+country 报价表")
-    p.add_argument("--service")
-    p.add_argument("--country", type=int)
+    p.add_argument("--service", help="不传用 config (默认 dr); 传空可拉所有 service")
+    p.add_argument("--country", type=int, help="不传用 config (默认 52)")
+    p.add_argument("--all", action="store_true",
+                   help="拉所有 country (覆盖 --country / config)")
     p.add_argument("--max-price", type=float, default=None,
                    help="高于此值时打 WARN")
     p.add_argument("--json", action="store_true")
@@ -540,12 +691,19 @@ def main():
     p = sub.add_parser("active", help="进行中的 activation")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("all-sms", help="拉某 activation 的所有 SMS (按 id 去重靠这个)")
+    p.add_argument("id")
+    p.add_argument("--size", type=int, default=20)
+    p.add_argument("--page", type=int, default=1)
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args()
     cfg = load_config()
     handlers = {
         "verify": cmd_verify, "balance": cmd_balance, "prices": cmd_prices,
         "acquire": cmd_acquire, "wait-otp": cmd_wait_otp,
         "cancel": cmd_cancel, "finish": cmd_finish, "active": cmd_active,
+        "all-sms": cmd_all_sms,
     }
     handlers[args.cmd](args, cfg)
 

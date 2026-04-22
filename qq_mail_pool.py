@@ -20,6 +20,7 @@ QQ IMAP:
     - 密码 = QQ 邮箱设置里生成的"授权码", 不是 QQ 登录密码
 """
 
+import base64
 import imaplib
 import email
 import select
@@ -31,6 +32,34 @@ import random
 import ssl
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
+
+
+def _imap_utf7_encode(name: str) -> bytes:
+    """RFC 3501 modified UTF-7 编码 mailbox 名 (兼容中文/特殊字符)"""
+    res = []
+    buf = []
+
+    def flush():
+        if buf:
+            text = "".join(buf)
+            b = text.encode("utf-16-be")
+            enc = base64.b64encode(b).rstrip(b"=").decode("ascii").replace("/", ",")
+            res.append("&" + enc + "-")
+            buf.clear()
+
+    for ch in name:
+        o = ord(ch)
+        if 0x20 <= o <= 0x7E:
+            flush()
+            if ch == "&":
+                res.append("&-")
+            else:
+                res.append(ch)
+        else:
+            buf.append(ch)
+    flush()
+    # SELECT 时用引号包起来, 避免空格/特殊字符歧义
+    return ('"' + "".join(res) + '"').encode("ascii")
 
 
 # ---- 名字池 (常见英文 first/last) ----
@@ -119,7 +148,7 @@ def extract_otp(content: str):
 
 class QQMailPool:
     def __init__(self, host, port, user, authcode, domain,
-                 poll_interval=4, debug=False):
+                 poll_interval=4, debug=False, folder="INBOX"):
         self.host = host
         self.port = int(port)
         self.user = user
@@ -127,6 +156,7 @@ class QQMailPool:
         self.domain = domain.lower().lstrip("@")
         self.poll_interval = max(1, int(poll_interval))
         self.debug = bool(debug)
+        self.folder = folder or "INBOX"
 
         # 收件箱: address(lower) -> [{uid, ts, subject, from, body}, ...] (新→旧)
         self._inbox = {}
@@ -170,6 +200,21 @@ class QQMailPool:
             pass
         return imap
 
+    def _select_folder(self, imap):
+        """SELECT 配置的文件夹, 自动用 modified UTF-7 编码非 ASCII 名"""
+        if all(0x20 <= ord(c) <= 0x7E for c in self.folder):
+            mailbox = self.folder
+        else:
+            mailbox = _imap_utf7_encode(self.folder)
+        typ, data = imap.select(mailbox)
+        if typ != "OK":
+            raise imaplib.IMAP4.error(
+                f"SELECT {self.folder!r} 失败: {typ} {data!r}"
+            )
+        if self.debug:
+            n = data[0].decode() if data and data[0] else "?"
+            self._log(f"SELECT {self.folder!r} → 邮件数={n}")
+
     # IDLE 单次最长持续时间. 设为 30s 而不是 25min: 即使 QQ 偶尔不推 EXISTS 通知,
     # 我们也每 30s 主动 DONE → poll 一次, 不会久等. 30s 比 25min 安全得多.
     IDLE_MAX_SECONDS = 30
@@ -181,7 +226,7 @@ class QQMailPool:
         while not self._stop.is_set():
             try:
                 imap = self._connect()
-                imap.select("INBOX")
+                self._select_folder(imap)
                 # 设定 baseline: 只关心从此刻起的新邮件
                 if self._last_uid == 0:
                     typ, data = imap.uid("SEARCH", None, "ALL")
@@ -566,6 +611,7 @@ def get_pool(config=None):
             domain=domain,
             poll_interval=config.get("mail_poll_interval", 4),
             debug=bool(config.get("mail_debug", False)),
+            folder=config.get("qq_imap_folder", "INBOX"),
         )
         pool.start()
         _pool_instance = pool
@@ -590,15 +636,20 @@ def _cli_inspect(cfg, count=5):
         imap.xatom("ID", '("name" "QQMailPool" "version" "1.0")')
     except Exception:
         pass
-    typ, data = imap.select("INBOX")
-    print(f"SELECT INBOX → {typ} 邮件总数={data[0].decode() if data else '?'}")
+    folder = cfg.get("qq_imap_folder", "INBOX")
+    if all(0x20 <= ord(c) <= 0x7E for c in folder):
+        mailbox = folder
+    else:
+        mailbox = _imap_utf7_encode(folder)
+    typ, data = imap.select(mailbox)
+    print(f"SELECT {folder!r} → {typ} 邮件总数={data[0].decode() if data else '?'}")
 
     typ, data = imap.uid("SEARCH", None, "ALL")
     if typ != "OK" or not data or not data[0]:
         print("SEARCH ALL 无结果")
         return
     uids = data[0].split()
-    print(f"INBOX 现有 UID 总数 = {len(uids)}, 最大 UID = {uids[-1].decode()}")
+    print(f"{folder} 现有 UID 总数 = {len(uids)}, 最大 UID = {uids[-1].decode()}")
 
     target_domain = "@" + cfg.get("mail_domain", "").lower()
     print(f"\n查找域名: {target_domain}")

@@ -315,10 +315,11 @@ class SentinelSolver:
             # 调 token —— 完全模拟 console 输入
             expr = (
                 "(async () => {"
-                "  try { try { await SentinelSDK.init(" + json.dumps(flow) + "); } catch(e) {} "
+                "  let ie = null;"
+                "  try { try { await SentinelSDK.init(" + json.dumps(flow) + "); } catch(e) { ie = String(e && e.stack || e); } "
                 "    const t = await SentinelSDK.token(" + json.dumps(flow) + ");"
-                "    return { ok: true, token: t };"
-                "  } catch(e) { return { ok: false, error: String(e && e.stack || e) }; }"
+                "    return { ok: true, token: t, init_err: ie };"
+                "  } catch(e) { return { ok: false, error: String(e && e.stack || e), init_err: ie }; }"
                 "})()"
             )
             r = await cdp_eval(expr, await_promise=True)
@@ -330,6 +331,10 @@ class SentinelSolver:
             result = (r.get("result") or {}).get("value")
 
             elapsed = round(time.time() - start, 2)
+            if isinstance(result, dict):
+                ie = result.get("init_err")
+                if ie:
+                    logger.warning(f"[{req_id}] SentinelSDK.init 报错(已被吞): {str(ie)[:400]}")
             if isinstance(result, dict) and result.get("ok"):
                 token = result.get("token")
                 if isinstance(token, str) and token.startswith("{") and '"c"' in token:
