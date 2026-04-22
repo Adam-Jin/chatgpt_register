@@ -20,11 +20,9 @@ from quart import Quart, jsonify, request
 from browser_configs import browser_config
 
 
-# 候选登录页：按顺序尝试，第一个能让 SentinelSDK 出现在 window 上的胜出
+# 直接从 auth.openai.com 入口加载，减少不必要的页面跳转
 CANDIDATE_PAGES = [
-    "https://auth.openai.com/log-in",
-    "https://chatgpt.com/auth/login",
-    "https://chatgpt.com/",
+    "https://auth.openai.com/",
 ]
 SDK_READY_JS = (
     "() => typeof window.SentinelSDK !== 'undefined' "
@@ -106,6 +104,7 @@ class SentinelSolver:
         self.channel = channel
         self.default_proxy = default_proxy
         self.browser_pool: asyncio.Queue = asyncio.Queue()
+        self.resource_cache = {}
         self.busy = 0
         self._playwright = None
 
@@ -191,6 +190,8 @@ class SentinelSolver:
                 {"name": "oai-did", "value": oai_did, "domain": ".openai.com", "path": "/"},
             ])
             page = await context.new_page()
+            await self._block_rendering(page)
+            self._attach_resource_cache(page, req_id)
             page.on("console", lambda m: logger.debug(f"[{req_id}] console {m.type}: {m.text[:200]}"))
             page.on("pageerror", lambda e: logger.debug(f"[{req_id}] pageerror: {str(e)[:200]}"))
 
@@ -424,6 +425,7 @@ class SentinelSolver:
             context = await browser.new_context(**ctx_opts)
             page = await context.new_page()
             await self._block_rendering(page)
+            self._attach_resource_cache(page, req_id)
 
             logger.info(f"[ts-{req_id}] (browser#{index}) goto {url[:100]}")
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -491,13 +493,18 @@ class SentinelSolver:
     # ---------- helpers from D3vin ----------
 
     async def _optimized_route_handler(self, route):
-        url = route.request.url
-        rt = route.request.resource_type
-        allowed_types = {"document", "script", "xhr", "fetch"}
-        allowed_domains = ["challenges.cloudflare.com",
-                           "static.cloudflareinsights.com",
-                           "cloudflare.com"]
-        if rt in allowed_types or any(d in url for d in allowed_domains):
+        req = route.request
+        rt = req.resource_type
+        if rt == "script" and req.method == "GET":
+            cached = self.resource_cache.get(req.url)
+            if cached:
+                await route.fulfill(
+                    status=cached["status"],
+                    headers=cached["headers"],
+                    body=cached["body"],
+                )
+                return
+        if rt in {"document", "script", "xhr", "fetch"}:
             await route.continue_()
         else:
             await route.abort()
@@ -507,6 +514,36 @@ class SentinelSolver:
 
     async def _unblock_rendering(self, page):
         await page.unroute("**/*", self._optimized_route_handler)
+
+    def _attach_resource_cache(self, page, req_id):
+        def _on_response(response):
+            asyncio.create_task(self._maybe_cache_script(response, req_id))
+        page.on("response", _on_response)
+
+    async def _maybe_cache_script(self, response, req_id):
+        try:
+            req = response.request
+            if req.method != "GET" or req.resource_type != "script" or response.status != 200:
+                return
+            body = await response.body()
+            if not body:
+                return
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
+            headers.pop("content-encoding", None)
+            headers.pop("transfer-encoding", None)
+            headers.pop("connection", None)
+            if req.url not in self.resource_cache:
+                self.resource_cache[req.url] = {
+                    "status": response.status,
+                    "headers": headers,
+                    "body": body,
+                }
+                if self.debug:
+                    logger.debug(f"[{req_id}] cache script: {req.url}")
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"[{req_id}] cache script 失败: {e}")
 
     async def _safe_click(self, page, selector, index):
         try:

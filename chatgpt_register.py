@@ -1623,9 +1623,11 @@ class ChatGPTRegister:
             return None
 
         ws_next = ws_data.get("continue_url", "")
-        orgs = ws_data.get("data", {}).get("orgs", [])
+        orgs = ws_data.get("data", {}).get("orgs", []) or ws_data.get("orgs", []) or []
         ws_page = (ws_data.get("page") or {}).get("type", "")
         self._print(f"[OAuth] workspace/select page={ws_page or '-'} next={(ws_next or '-')[:140]}")
+        self._print(f"[OAuth] workspace/select keys={list(ws_data.keys())} "
+                    f"data_keys={list((ws_data.get('data') or {}).keys())} orgs_len={len(orgs)}")
 
         org_id = None
         project_id = None
@@ -1634,6 +1636,16 @@ class ChatGPTRegister:
             projects = (orgs[0] or {}).get("projects", [])
             if projects:
                 project_id = (projects[0] or {}).get("id")
+        else:
+            # 退路: 从 oai-client-auth-session cookie 解析 orgs (workspace/select 后服务端会刷新)
+            sess2 = self._decode_oauth_session_cookie() or {}
+            sess_orgs = (sess2.get("orgs") or [])
+            if sess_orgs:
+                org_id = (sess_orgs[0] or {}).get("id")
+                projs = (sess_orgs[0] or {}).get("projects", []) or []
+                if projs:
+                    project_id = (projs[0] or {}).get("id")
+                self._print(f"[OAuth] orgs 从 session cookie 兜底, org_id={org_id} project_id={project_id}")
 
         if org_id:
             org_body = {"org_id": org_id}
@@ -1653,6 +1665,9 @@ class ChatGPTRegister:
                 impersonate=self.impersonate,
             )
             self._print(f"[OAuth] organization/select -> {resp_org.status_code}")
+            if resp_org.status_code >= 400:
+                self._print(f"[OAuth] organization/select 错误: body={resp_org.text[:300]} "
+                            f"req_body={org_body}")
             if resp_org.status_code in (301, 302, 303, 307, 308):
                 loc = resp_org.headers.get("Location", "")
                 if loc.startswith("/"):
@@ -1880,10 +1895,180 @@ class ChatGPTRegister:
         page_type = (verify_data.get("page") or {}).get("type", "") or page_type
         self._print(f"[OAuth] verify page={page_type or '-'} next={(continue_url or '-')[:140]}")
 
+        # MFA challenge (密码通过后服务端要求二次验证, 走邮件 OTP 因子)
+        need_mfa_challenge = (
+            page_type == "mfa_challenge"
+            or "/mfa-challenge/" in (continue_url or "")
+        )
+        if need_mfa_challenge:
+            self._print("[OAuth] 4/7 检测到 MFA challenge, 走邮件 OTP 因子")
+
+            session_data = self._decode_oauth_session_cookie() or {}
+            factors = (
+                session_data.get("mfa_challenge_factors")
+                or session_data.get("mfa_factors")
+                or []
+            )
+            email_factor = next(
+                (f for f in factors if (f or {}).get("factor_type") == "email"),
+                None,
+            )
+            if not email_factor:
+                self._print(f"[OAuth] mfa_challenge 未找到 email 因子, "
+                            f"factors={[(f or {}).get('factor_type') for f in factors]}")
+                return None
+            factor_id = email_factor.get("id") or "email-otp"
+            self._print(f"[OAuth] 选用 MFA email 因子 id={factor_id}")
+
+            headers_mfa = _oauth_json_headers(f"{OAUTH_ISSUER}/mfa-challenge")
+            try:
+                resp_issue = self.session.post(
+                    f"{OAUTH_ISSUER}/api/accounts/mfa/issue_challenge",
+                    json={"id": factor_id, "type": "email", "force_fresh_challenge": False},
+                    headers=headers_mfa,
+                    timeout=30,
+                    allow_redirects=False,
+                    impersonate=self.impersonate,
+                )
+            except Exception as e:
+                self._print(f"[OAuth] mfa/issue_challenge 异常: {e}")
+                return None
+            self._print(f"[OAuth] /mfa/issue_challenge -> {resp_issue.status_code}")
+            if resp_issue.status_code not in (200, 201):
+                self._print(f"[OAuth] mfa/issue_challenge 失败: {resp_issue.text[:200]}")
+                return None
+
+            headers_verify_mfa = _oauth_json_headers(f"{OAUTH_ISSUER}/mfa-challenge/email-otp")
+            tried_codes = set()
+            mfa_success = False
+            mfa_deadline = time.time() + 120
+
+            qq_pool = getattr(self, "qq_pool", None)
+            qq_addr = getattr(self, "qq_pool_email", None)
+            qq_since = max(time.time() - 10, getattr(self, "qq_pool_since", 0) or 0)
+            self.qq_pool_since = qq_since
+
+            def _submit_mfa_code(code_):
+                try:
+                    r_ = self.session.post(
+                        f"{OAUTH_ISSUER}/api/accounts/mfa/verify",
+                        json={"id": factor_id, "type": "email", "code": code_},
+                        headers=headers_verify_mfa,
+                        timeout=30,
+                        allow_redirects=False,
+                        impersonate=self.impersonate,
+                    )
+                except Exception as e:
+                    self._print(f"[OAuth] mfa/verify 异常: {e}")
+                    return None
+                self._print(f"[OAuth] /mfa/verify -> {r_.status_code}")
+                if r_.status_code != 200:
+                    self._print(f"[OAuth] MFA OTP 无效: {r_.text[:160]}")
+                    return None
+                try:
+                    return r_.json()
+                except Exception:
+                    self._print("[OAuth] mfa/verify 响应解析失败")
+                    return None
+
+            if qq_pool and qq_addr:
+                self._print(f"[OAuth] (QQ) MFA OTP 基线时间戳设为 {int(qq_since)}")
+                while not mfa_success and time.time() < mfa_deadline:
+                    items = qq_pool.get_messages_since(qq_addr, since_ts=qq_since or 0)
+                    candidate_codes = []
+                    for item in items[:12]:
+                        code_ = _qq_extract_otp(item.get("body", "")) if _qq_extract_otp else None
+                        if code_ and code_ not in tried_codes:
+                            candidate_codes.append(code_)
+                    if not candidate_codes:
+                        elapsed = int(120 - max(0, mfa_deadline - time.time()))
+                        self._print(f"[OAuth] (QQ) MFA OTP 等待中... ({elapsed}s/120s)")
+                        time.sleep(2)
+                        continue
+                    for otp_code in candidate_codes:
+                        tried_codes.add(otp_code)
+                        self._print(f"[OAuth] (QQ) 尝试 MFA OTP: {otp_code}")
+                        data = _submit_mfa_code(otp_code)
+                        if data is None:
+                            continue
+                        continue_url = data.get("continue_url", "") or continue_url
+                        page_type = (data.get("page") or {}).get("type", "") or page_type
+                        self._print(f"[OAuth] MFA OTP 验证通过 page={page_type or '-'} "
+                                    f"next={(continue_url or '-')[:140]}")
+                        mfa_success = True
+                        break
+                    if not mfa_success:
+                        time.sleep(2)
+                if not mfa_success:
+                    self._print(f"[OAuth] (QQ) MFA OTP 验证失败, 已尝试 {len(tried_codes)} 个")
+                    return None
+
+            elif not mail_token:
+                while time.time() < mfa_deadline and not mfa_success:
+                    manual_code = self._prompt_otp_manually(
+                        timeout=int(max(0, mfa_deadline - time.time()))
+                    )
+                    if not manual_code:
+                        self._print("[OAuth] 用户未提供 MFA OTP, 放弃")
+                        return None
+                    if manual_code in tried_codes:
+                        self._print("[OAuth] 该 MFA OTP 已尝试过, 请重新输入")
+                        continue
+                    tried_codes.add(manual_code)
+                    data = _submit_mfa_code(manual_code)
+                    if data is None:
+                        continue
+                    continue_url = data.get("continue_url", "") or continue_url
+                    page_type = (data.get("page") or {}).get("type", "") or page_type
+                    self._print(f"[OAuth] MFA OTP 验证通过 page={page_type or '-'} "
+                                f"next={(continue_url or '-')[:140]}")
+                    mfa_success = True
+                if not mfa_success:
+                    self._print("[OAuth] 手动 MFA OTP 验证失败")
+                    return None
+
+            else:
+                while not mfa_success and time.time() < mfa_deadline:
+                    messages = self._fetch_emails_duckmail(mail_token) or []
+                    candidate_codes = []
+                    for msg in messages[:12]:
+                        msg_id = msg.get("id") or msg.get("@id")
+                        if not msg_id:
+                            continue
+                        detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
+                        if not detail:
+                            continue
+                        content = detail.get("text") or detail.get("html") or ""
+                        code_ = self._extract_verification_code(content)
+                        if code_ and code_ not in tried_codes:
+                            candidate_codes.append(code_)
+                    if not candidate_codes:
+                        elapsed = int(120 - max(0, mfa_deadline - time.time()))
+                        self._print(f"[OAuth] MFA OTP 等待中... ({elapsed}s/120s)")
+                        time.sleep(2)
+                        continue
+                    for otp_code in candidate_codes:
+                        tried_codes.add(otp_code)
+                        self._print(f"[OAuth] 尝试 MFA OTP: {otp_code}")
+                        data = _submit_mfa_code(otp_code)
+                        if data is None:
+                            continue
+                        continue_url = data.get("continue_url", "") or continue_url
+                        page_type = (data.get("page") or {}).get("type", "") or page_type
+                        self._print(f"[OAuth] MFA OTP 验证通过 page={page_type or '-'} "
+                                    f"next={(continue_url or '-')[:140]}")
+                        mfa_success = True
+                        break
+                    if not mfa_success:
+                        time.sleep(2)
+                if not mfa_success:
+                    self._print(f"[OAuth] MFA OTP 验证失败, 已尝试 {len(tried_codes)} 个")
+                    return None
+
         need_oauth_otp = (
             page_type == "email_otp_verification"
             or "email-verification" in (continue_url or "")
-            or "email-otp" in (continue_url or "")
+            or ("email-otp" in (continue_url or "") and "/mfa-challenge/" not in (continue_url or ""))
         )
 
         if need_oauth_otp:
