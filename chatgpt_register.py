@@ -8,10 +8,13 @@ import os
 import re
 import uuid
 import json
+import queue
 import random
 import string
 import time
 import sys
+import atexit
+import asyncio
 import threading
 import traceback
 import secrets
@@ -23,6 +26,14 @@ import urllib.error
 import urllib.request
 
 from curl_cffi import requests as curl_requests
+
+try:
+    from sentinel_solver import SentinelSolver as EmbeddedSentinelSolver
+except Exception as _sentinel_import_exc:
+    EmbeddedSentinelSolver = None
+    _EMBEDDED_SENTINEL_IMPORT_ERROR = _sentinel_import_exc
+else:
+    _EMBEDDED_SENTINEL_IMPORT_ERROR = None
 
 try:
     from curl_cffi.requests import BrowserType
@@ -40,15 +51,54 @@ except Exception:  # 接码模块缺失时降级 (add_phone 阶段才会真的�
     AcquireFailed = Exception
 
 try:
-    from phone_pool import PhonePool
+    from phone_pool import PhonePool, PhonePoolCapacityExhausted
 except Exception:
     PhonePool = None
+    PhonePoolCapacityExhausted = Exception
+
+try:
+    import monitor
+except Exception:
+    monitor = None
 
 try:
     from qq_mail_pool import get_pool as _get_qq_mail_pool, extract_otp as _qq_extract_otp
 except Exception:
     _get_qq_mail_pool = None
     _qq_extract_otp = None
+
+# 全局线程锁
+_print_lock = threading.Lock()
+_file_lock = threading.Lock()
+
+
+_ANSI_RESET = "\033[0m"
+_ANSI_LEVEL = {
+    "info": "\033[37m",
+    "success": "\033[1;32m",
+    "warn": "\033[1;33m",
+    "error": "\033[1;31m",
+}
+
+
+def _stdout_supports_color() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _console_log(message: str, *, level: str = "info") -> None:
+    text = str(message)
+    if _stdout_supports_color():
+        text = f"{_ANSI_LEVEL.get(level, _ANSI_LEVEL['info'])}{text}{_ANSI_RESET}"
+    with _print_lock:
+        print(text)
+
+
+def _console_block(lines, *, level: str = "info") -> None:
+    for line in lines:
+        _console_log(line, level=level)
 
 # ================= 加载配置 =================
 def _load_config():
@@ -67,15 +117,23 @@ def _load_config():
         "ak_file": "ak.txt",
         "rk_file": "rk.txt",
         "max_workers": 3,
+        "tui_enabled": True,
         "token_json_dir": "codex_tokens",
         "upload_api_url": "",
         "upload_api_token": "",
         "sentinel_solver_url": "http://127.0.0.1:5732",
+        "sentinel_inprocess": True,
+        "sentinel_solver_thread": 0,
+        "sentinel_solver_headless": True,
+        "sentinel_solver_channel": "chromium",
+        "sentinel_solver_debug": False,
         # 接码 provider: "herosms" (推荐) / "quackr" / "" 关闭
         "sms_provider": "herosms",
         "sms_max_retries": 3,
         "sms_wait_otp_timeout": 120,
         "sms_poll_interval": 5,
+        "phone_max_active": 0,
+        "phone_acquire_timeout": 60.0,
         # herosms 默认 (HeroSmsProvider 内部还会再读一次, 这里只为方便覆盖)
         "herosms_api_key": "",
         "herosms_country": 52,
@@ -90,7 +148,7 @@ def _load_config():
                 file_config = json.load(f)
                 config.update(file_config)
         except Exception as e:
-            print(f"⚠️ 加载 config.json 失败: {e}")
+            _console_log(f"⚠️ 加载 config.json 失败: {e}", level="warn")
 
     # 环境变量优先级更高
     config["duckmail_api_base"] = os.environ.get("DUCKMAIL_API_BASE", config["duckmail_api_base"])
@@ -109,8 +167,15 @@ def _load_config():
     config["upload_api_url"] = os.environ.get("UPLOAD_API_URL", config["upload_api_url"])
     config["upload_api_token"] = os.environ.get("UPLOAD_API_TOKEN", config["upload_api_token"])
     config["sentinel_solver_url"] = os.environ.get("SENTINEL_SOLVER_URL", config["sentinel_solver_url"])
+    config["sentinel_inprocess"] = os.environ.get("SENTINEL_INPROCESS", config["sentinel_inprocess"])
+    config["sentinel_solver_thread"] = int(os.environ.get("SENTINEL_SOLVER_THREAD", config["sentinel_solver_thread"]))
+    config["sentinel_solver_headless"] = os.environ.get("SENTINEL_SOLVER_HEADLESS", config["sentinel_solver_headless"])
+    config["sentinel_solver_channel"] = os.environ.get("SENTINEL_SOLVER_CHANNEL", config["sentinel_solver_channel"])
+    config["sentinel_solver_debug"] = os.environ.get("SENTINEL_SOLVER_DEBUG", config["sentinel_solver_debug"])
     config["sms_provider"] = os.environ.get("SMS_PROVIDER", config["sms_provider"])
     config["herosms_api_key"] = os.environ.get("HEROSMS_API_KEY", config["herosms_api_key"])
+    config["phone_max_active"] = int(os.environ.get("PHONE_MAX_ACTIVE", config["phone_max_active"] or 0))
+    config["phone_acquire_timeout"] = float(os.environ.get("PHONE_ACQUIRE_TIMEOUT", config["phone_acquire_timeout"]))
 
     return config
 
@@ -145,14 +210,22 @@ AK_FILE = _CONFIG["ak_file"]
 RK_FILE = _CONFIG["rk_file"]
 DEFAULT_MAX_WORKERS = _CONFIG["max_workers"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
+TUI_ENABLED = _as_bool(_CONFIG.get("tui_enabled", True))
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
 SENTINEL_SOLVER_URL = _CONFIG["sentinel_solver_url"]
+SENTINEL_INPROCESS = _as_bool(_CONFIG.get("sentinel_inprocess", True))
+SENTINEL_SOLVER_THREAD = int(_CONFIG.get("sentinel_solver_thread", 0) or 0)
+SENTINEL_SOLVER_HEADLESS = _as_bool(_CONFIG.get("sentinel_solver_headless", True))
+SENTINEL_SOLVER_CHANNEL = _CONFIG.get("sentinel_solver_channel", "chromium")
+SENTINEL_SOLVER_DEBUG = _as_bool(_CONFIG.get("sentinel_solver_debug", False))
 SMS_PROVIDER_NAME = (_CONFIG.get("sms_provider") or "").strip()
 SMS_MAX_RETRIES = int(_CONFIG.get("sms_max_retries", 3))
 SMS_WAIT_OTP_TIMEOUT = int(_CONFIG.get("sms_wait_otp_timeout", 120))
 SMS_POLL_INTERVAL = int(_CONFIG.get("sms_poll_interval", 5))
 PHONE_MAX_REUSE = int(_CONFIG.get("phone_max_reuse", 3))
+PHONE_MAX_ACTIVE = int(_CONFIG.get("phone_max_active") or 0)
+PHONE_ACQUIRE_TIMEOUT = float(_CONFIG.get("phone_acquire_timeout", 60.0))
 PHONE_POOL_LEASE_SECONDS = int(_CONFIG.get("phone_pool_lease_seconds", 60))
 PHONE_POOL_HEARTBEAT_SECONDS = int(_CONFIG.get("phone_pool_heartbeat_seconds", 30))
 PHONE_POOL_ENABLED = bool(_CONFIG.get("phone_pool_enabled", True))
@@ -160,6 +233,95 @@ PHONE_POOL_ENABLED = bool(_CONFIG.get("phone_pool_enabled", True))
 # 全局共享的号池 (跨注册线程共享 lease 状态; 进程内单例)
 _phone_pool_singleton = None
 _phone_pool_lock = threading.Lock()
+_run_metrics_lock = threading.Lock()
+_run_metrics = {
+    "done": 0,
+    "success": 0,
+    "fail": 0,
+    "warn": 0,
+    "cap_skipped": 0,
+    "spent": 0.0,
+}
+_intake_paused_event = threading.Event()
+_shutdown_event = threading.Event()
+_force_no_tui = False
+_force_tui = False
+_inflight_workers_lock = threading.Lock()
+_inflight_workers: set[str] = set()
+
+
+def _monitor_emit(channel_name, message, *, level="info", worker_id=None, **fields):
+    if monitor is not None:
+        monitor.emit(channel_name, message, level=level, worker_id=worker_id, **fields)
+        return
+    _console_log(f"[{channel_name}] {message}", level=level)
+
+
+def _worker_log(message, *, level="info", **fields):
+    _monitor_emit("worker", message, level=level, **fields)
+
+
+def _system_log(message, *, level="info", **fields):
+    _monitor_emit("system", message, level=level, **fields)
+
+
+def _summary_snapshot():
+    with _run_metrics_lock:
+        return dict(_run_metrics)
+
+
+def _reset_run_metrics():
+    with _run_metrics_lock:
+        for key in ("done", "success", "fail", "warn", "cap_skipped"):
+            _run_metrics[key] = 0
+        _run_metrics["spent"] = 0.0
+    with _inflight_workers_lock:
+        _inflight_workers.clear()
+
+
+def _bump_metric(key, delta=1):
+    with _run_metrics_lock:
+        _run_metrics[key] = _run_metrics.get(key, 0) + delta
+
+
+def _mark_worker_active(worker_id: str) -> None:
+    if not worker_id:
+        return
+    with _inflight_workers_lock:
+        _inflight_workers.add(worker_id)
+
+
+def _mark_worker_idle(worker_id: str) -> None:
+    if not worker_id:
+        return
+    with _inflight_workers_lock:
+        _inflight_workers.discard(worker_id)
+
+
+def _inflight_workers_snapshot():
+    with _inflight_workers_lock:
+        return sorted(_inflight_workers)
+
+
+def _mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return email or "-"
+    local, domain = email.split("@", 1)
+    if len(local) <= 3:
+        local_masked = local[0] + "***"
+    else:
+        local_masked = local[:3] + "***"
+    return f"{local_masked}@{domain}"
+
+
+def _is_tui_enabled() -> bool:
+    if _force_tui:
+        return True
+    if _force_no_tui:
+        return False
+    if _as_bool(os.environ.get("CHATGPT_REGISTER_NO_TUI")):
+        return False
+    return TUI_ENABLED
 
 
 def _get_phone_pool():
@@ -177,17 +339,20 @@ def _get_phone_pool():
             pool = PhonePool(
                 provider,
                 max_reuse=PHONE_MAX_REUSE,
+                max_active=PHONE_MAX_ACTIVE,
+                acquire_timeout=PHONE_ACQUIRE_TIMEOUT,
                 lease_seconds=PHONE_POOL_LEASE_SECONDS,
                 heartbeat_seconds=PHONE_POOL_HEARTBEAT_SECONDS,
+                log=monitor.channel("phone_pool") if monitor is not None else print,
             )
             try:
                 pool.reconcile()
             except Exception as e:
-                print(f"[phone_pool] reconcile 失败 (忽略, 继续): {e}")
+                _system_log(f"reconcile 失败 (忽略, 继续): {e}", level="warn")
             _phone_pool_singleton = pool
             return pool
         except Exception as e:
-            print(f"[phone_pool] 初始化失败, 走单次 acquire 模式: {e}")
+            _system_log(f"phone_pool 初始化失败, 走单次 acquire 模式: {e}", level="warn")
             return None
 
 # 自有域名 catch-all (Cloudflare Email Routing → QQ) 配置
@@ -197,13 +362,11 @@ MAIL_DOMAIN = _CONFIG.get("mail_domain", "")
 HAS_DOMAIN_CATCHALL = bool(QQ_IMAP_USER and QQ_IMAP_AUTHCODE and MAIL_DOMAIN)
 
 if not DUCKMAIL_BEARER:
-    print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
-    print("   文件: config.json -> duckmail_bearer")
-    print("   环境变量: export DUCKMAIL_BEARER='your_api_key_here'")
-
-# 全局线程锁
-_print_lock = threading.Lock()
-_file_lock = threading.Lock()
+    _console_block([
+        "⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量",
+        "   文件: config.json -> duckmail_bearer",
+        "   环境变量: export DUCKMAIL_BEARER='your_api_key_here'",
+    ], level="warn")
 
 
 # Chrome 指纹配置: impersonate 与 sec-ch-ua 尽量匹配真实浏览器
@@ -288,12 +451,211 @@ def _generate_pkce():
     return code_verifier, code_challenge
 
 
+_sentinel_runtime_singleton = None
+_sentinel_runtime_lock = threading.Lock()
+_sentinel_runtime_config = {
+    "thread": None,
+    "default_proxy": None,
+}
+
+
+class _InProcessSentinelRuntime:
+    def __init__(self, headless, thread, debug, channel, default_proxy):
+        self.headless = headless
+        self.thread = thread
+        self.debug = debug
+        self.channel = channel
+        self.default_proxy = default_proxy
+        self._thread = None
+        self._loop = None
+        self._solver = None
+        self._ready = threading.Event()
+        self._start_lock = threading.Lock()
+        self._start_error = None
+
+    def _run_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            self._solver = EmbeddedSentinelSolver(
+                headless=self.headless,
+                thread=self.thread,
+                debug=self.debug,
+                channel=self.channel,
+                default_proxy=self.default_proxy,
+                enable_http=False,
+                log=monitor.channel("sentinel") if monitor is not None else None,
+            )
+            loop.run_until_complete(self._solver.ensure_started())
+        except Exception as e:
+            self._start_error = e
+            self._ready.set()
+            try:
+                if self._solver is not None:
+                    loop.run_until_complete(self._solver._shutdown())
+            except Exception:
+                pass
+            loop.close()
+            self._loop = None
+            return
+
+        self._ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                if self._solver is not None:
+                    loop.run_until_complete(self._solver._shutdown())
+            except Exception:
+                pass
+            loop.close()
+            self._loop = None
+
+    def start(self, timeout=120):
+        with self._start_lock:
+            if not (self._thread and self._thread.is_alive()):
+                self._ready.clear()
+                self._start_error = None
+                self._thread = threading.Thread(
+                    target=self._run_loop,
+                    name="sentinel-solver",
+                    daemon=True,
+                )
+                self._thread.start()
+
+        if not self._ready.wait(timeout):
+            raise TimeoutError("in-process sentinel solver 启动超时")
+        if self._start_error is not None:
+            raise RuntimeError(f"in-process sentinel solver 启动失败: {self._start_error}")
+
+    def _submit(self, coro_factory, timeout):
+        self.start(timeout=max(timeout, 30))
+        if self._loop is None or self._solver is None:
+            raise RuntimeError("in-process sentinel solver event loop 不可用")
+        coro = coro_factory(self._solver)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    def health(self, timeout=30):
+        return self._submit(lambda solver: solver.health_data(), timeout)
+
+    def solve_token(self, flow, oai_did, user_agent, proxy=None, timeout=60):
+        return self._submit(
+            lambda solver: solver.solve_token(
+                flow=flow,
+                oai_did=oai_did,
+                ua=user_agent,
+                proxy=proxy,
+            ),
+            timeout,
+        )
+
+    def close(self, timeout=30):
+        with self._start_lock:
+            loop = self._loop
+            worker = self._thread
+            solver = self._solver
+            if loop is None or worker is None:
+                return
+            self._thread = None
+            self._solver = None
+            self._ready.clear()
+
+        try:
+            if solver is not None:
+                future = asyncio.run_coroutine_threadsafe(solver._shutdown(), loop)
+                future.result(timeout=timeout)
+        except Exception:
+            pass
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        try:
+            worker.join(timeout)
+        except Exception:
+            pass
+
+
+def _get_inprocess_sentinel_runtime():
+    global _sentinel_runtime_singleton
+    if not SENTINEL_INPROCESS:
+        return None
+    if EmbeddedSentinelSolver is None:
+        raise RuntimeError(f"sentinel_solver 模块导入失败: {_EMBEDDED_SENTINEL_IMPORT_ERROR}")
+    with _sentinel_runtime_lock:
+        if _sentinel_runtime_singleton is None:
+            default_proxy = _sentinel_runtime_config["default_proxy"]
+            if default_proxy is None:
+                default_proxy = DEFAULT_PROXY or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+                                or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+            thread = _sentinel_runtime_config["thread"]
+            if thread is None:
+                thread = SENTINEL_SOLVER_THREAD if SENTINEL_SOLVER_THREAD > 0 else (DEFAULT_MAX_WORKERS + 1)
+            _sentinel_runtime_singleton = _InProcessSentinelRuntime(
+                headless=SENTINEL_SOLVER_HEADLESS,
+                thread=thread,
+                debug=SENTINEL_SOLVER_DEBUG,
+                channel=SENTINEL_SOLVER_CHANNEL,
+                default_proxy=default_proxy,
+            )
+    return _sentinel_runtime_singleton
+
+
+def _configure_inprocess_sentinel_runtime(*, thread=None, default_proxy=None):
+    global _sentinel_runtime_singleton
+    with _sentinel_runtime_lock:
+        should_reset = _sentinel_runtime_singleton is not None
+        if thread is not None:
+            _sentinel_runtime_config["thread"] = int(thread)
+        if default_proxy is not None:
+            _sentinel_runtime_config["default_proxy"] = default_proxy
+        if should_reset:
+            try:
+                _sentinel_runtime_singleton.close()
+            except Exception:
+                pass
+            _sentinel_runtime_singleton = None
+
+
+def _shutdown_inprocess_sentinel_runtime():
+    runtime = _sentinel_runtime_singleton
+    if runtime is None:
+        return
+    try:
+        runtime.close()
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_inprocess_sentinel_runtime)
+
+
 # sentinel token 改由 sentinel_solver.py 服务在真浏览器里生成；
 # 旧的 SentinelTokenGenerator/fetch_sentinel_challenge/build_sentinel_token 已废弃，
 # 因为 OpenAI 把 PoW config schema 升到 25 字段并加了 Turnstile VM，本地无法复现。
 
 def _request_sentinel_token(flow, device_id, user_agent, proxy=None, timeout=60):
-    """同步调用本地 sentinel_solver 服务，拿到 openai-sentinel-token 字符串。"""
+    """优先走进程内 solver，回退到本地 HTTP solver 服务。"""
+    if SENTINEL_INPROCESS:
+        try:
+            runtime = _get_inprocess_sentinel_runtime()
+            token, err = runtime.solve_token(
+                flow=flow,
+                oai_did=device_id,
+                user_agent=user_agent,
+                proxy=proxy,
+                timeout=timeout,
+            )
+            if token:
+                return token
+            _console_log(f"[Sentinel] in-process solver 失败: {err}", level="error")
+            return None
+        except Exception as e:
+            _console_log(f"[Sentinel] in-process solver 调用失败: {e}", level="error")
+            return None
+
     if not SENTINEL_SOLVER_URL:
         return None
     url = SENTINEL_SOLVER_URL.rstrip("/") + "/sentinel/token"
@@ -321,13 +683,21 @@ def _request_sentinel_token(flow, device_id, user_agent, proxy=None, timeout=60)
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             err_body = ""
-        print(f"[Sentinel] solver HTTP {e.code}: {err_body[:200]}")
+        _console_log(f"[Sentinel] solver HTTP {e.code}: {err_body[:200]}", level="error")
     except Exception as e:
-        print(f"[Sentinel] solver 调用失败: {e}")
+        _console_log(f"[Sentinel] solver 调用失败: {e}", level="error")
     return None
 
 
 def _check_sentinel_solver_health(timeout=5):
+    if SENTINEL_INPROCESS:
+        try:
+            runtime = _get_inprocess_sentinel_runtime()
+            data = runtime.health(timeout=max(timeout, 30))
+            return True, data
+        except Exception as e:
+            return False, str(e)
+
     if not SENTINEL_SOLVER_URL:
         return False, "SENTINEL_SOLVER_URL 未配置"
     url = SENTINEL_SOLVER_URL.rstrip("/") + "/health"
@@ -380,7 +750,7 @@ def _append_pending_oauth(email: str, password: str, email_pwd: str, mail_provid
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"{email}----{password}----{email_pwd}----{mail_provider or ''}\n")
     except Exception as e:
-        print(f"[Warn] 写 pending_oauth.txt 失败: {e}")
+        _console_log(f"[Warn] 写 pending_oauth.txt 失败: {e}", level="warn")
 
 
 def _save_codex_tokens(email: str, tokens: dict):
@@ -469,14 +839,11 @@ def _upload_token_json(filepath):
         )
 
         if resp.status_code == 200:
-            with _print_lock:
-                print(f"  [CPA] Token JSON 已上传到 CPA 管理平台")
+            _console_log("  [CPA] Token JSON 已上传到 CPA 管理平台", level="success")
         else:
-            with _print_lock:
-                print(f"  [CPA] 上传失败: {resp.status_code} - {resp.text[:200]}")
+            _console_log(f"  [CPA] 上传失败: {resp.status_code} - {resp.text[:200]}", level="error")
     except Exception as e:
-        with _print_lock:
-            print(f"  [CPA] 上传异常: {e}")
+        _console_log(f"  [CPA] 上传异常: {e}", level="error")
     finally:
         if mp:
             mp.close()
@@ -699,6 +1066,8 @@ class ChatGPTRegister:
 
     def __init__(self, proxy: str = None, tag: str = ""):
         self.tag = tag  # 线程标识，用于日志
+        self.account_id = None
+        self.email = None
         self.device_id = str(uuid.uuid4())
         self.auth_session_logging_id = str(uuid.uuid4())
         self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
@@ -739,13 +1108,29 @@ class ChatGPTRegister:
             except Exception:
                 lines.append(f"{prefix}[Response] {str(body)[:1000]}")
         lines.append(f"{'='*60}")
-        with _print_lock:
-            print("\n".join(lines))
+        _monitor_emit("worker", "\n".join(lines), step=step, account=_mask_email(getattr(self, "email", "")))
 
     def _print(self, msg):
         prefix = f"[{self.tag}] " if self.tag else ""
-        with _print_lock:
-            print(f"{prefix}{msg}")
+        step = None
+        if str(msg).startswith("[") and "]" in str(msg):
+            step = str(msg)[1:str(msg).find("]")]
+        _monitor_emit(
+            "worker",
+            f"{prefix}{msg}",
+            step=step,
+            account=_mask_email(getattr(self, "email", "")),
+        )
+
+    def _channel_log(self, channel_name, msg, *, level="info", step=None):
+        prefix = f"[{self.tag}] " if self.tag else ""
+        _monitor_emit(
+            channel_name,
+            f"{prefix}{msg}",
+            level=level,
+            step=step,
+            account=_mask_email(getattr(self, "email", "")),
+        )
 
     # ==================== DuckMail 临时邮箱 ====================
 
@@ -1050,6 +1435,8 @@ class ChatGPTRegister:
 
     def run_register(self, email, password, name, birthdate, mail_token):
         """使用 DuckMail 的注册流程"""
+        self.email = email
+        self.account_id = email
         self.visit_homepage()
         _random_delay(0.3, 0.8)
         csrf = self.get_csrf()
@@ -1225,6 +1612,14 @@ class ChatGPTRegister:
             except NoNumberAvailable as e:
                 self._print(f"[Phone] {e}")
                 return None, None
+            except PhonePoolCapacityExhausted as e:
+                _bump_metric("cap_skipped")
+                self._print(
+                    f"[Phone] pool cap exhausted {e.current_active}/{e.max_active}, "
+                    "skip current account"
+                )
+                _bump_metric("warn")
+                return None, None
             except (AcquireFailed, SmsProviderError) as e:
                 self._print(f"[Phone] acquire 异常: {e}")
                 last_err = e
@@ -1260,7 +1655,7 @@ class ChatGPTRegister:
                     result = provider.wait_otp_with_id(
                         lease.to_session(), timeout=SMS_WAIT_OTP_TIMEOUT,
                         poll_interval=SMS_POLL_INTERVAL,
-                        log=lambda s: self._print(s),
+                        log=lambda s: self._channel_log("sms", s, step="Phone"),
                         since_sms_ids=baseline,
                         on_lease_lost=lease.lease_lost_check,
                     )
@@ -1351,7 +1746,7 @@ class ChatGPTRegister:
                 otp = provider.wait_otp(
                     sess, timeout=SMS_WAIT_OTP_TIMEOUT,
                     poll_interval=SMS_POLL_INTERVAL,
-                    log=lambda s: self._print(s))
+                    log=lambda s: self._channel_log("sms", s, step="Phone"))
             except Exception as e:
                 self._print(f"[Phone] wait_otp 异常: {e}")
                 otp = None
@@ -2360,7 +2755,10 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
             mail_token = None
             reg._print(f"[Custom] 使用指定邮箱: {email}")
         elif mail_provider == "domain_catchall":
-            qq_pool = _get_qq_mail_pool(_CONFIG) if _get_qq_mail_pool else None
+            qq_pool = _get_qq_mail_pool(
+                _CONFIG,
+                log=monitor.channel("email") if monitor is not None else None,
+            ) if _get_qq_mail_pool else None
             if not qq_pool:
                 raise Exception("QQ catch-all 池未初始化, 检查 config.json 中 qq_imap_user/authcode/mail_domain")
             qq_addr = qq_pool.acquire_email()
@@ -2384,14 +2782,19 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
         chatgpt_password = _generate_password()
         name = _random_name()
         birthdate = _random_birthdate()
-
-        with _print_lock:
-            print(f"\n{'='*60}")
-            print(f"  [{idx}/{total}] 注册: {email}")
-            print(f"  ChatGPT密码: {chatgpt_password}")
-            print(f"  邮箱密码: {email_pwd}")
-            print(f"  姓名: {name} | 生日: {birthdate}")
-            print(f"{'='*60}")
+        reg.email = email
+        _worker_log(
+            "\n".join([
+                f"{'='*60}",
+                f"  [{idx}/{total}] 注册: {email}",
+                f"  ChatGPT密码: {chatgpt_password}",
+                f"  邮箱密码: {email_pwd}",
+                f"  姓名: {name} | 生日: {birthdate}",
+                f"{'='*60}",
+            ]),
+            account=_mask_email(email),
+            step="register",
+        )
 
         # 2. 执行注册流程
         reg.run_register(email, chatgpt_password, name, birthdate, mail_token)
@@ -2419,15 +2822,14 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
             with open(output_file, "a", encoding="utf-8") as out:
                 out.write(f"{email}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n")
 
-        with _print_lock:
-            print(f"\n[OK] [{tag}] {email} 注册成功!")
+        _worker_log(f"[OK] [{tag}] {email} 注册成功!", level="success",
+                    account=_mask_email(email), step="done")
         return True, email, None
 
     except Exception as e:
         error_msg = str(e)
-        with _print_lock:
-            print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
-            traceback.print_exc()
+        _worker_log(f"[FAIL] [{idx}] 注册失败: {error_msg}", level="error", step="failed")
+        _monitor_emit("system", traceback.format_exc(), level="error")
         # 失败也释放, 避免内存堆积
         if qq_pool and qq_addr:
             try:
@@ -2495,11 +2897,16 @@ def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, prox
             qq_addr = email
             reg._print(f"[Retry] 已注入 QQ catch-all: {email}")
 
-        with _print_lock:
-            print(f"\n{'='*60}")
-            print(f"  [{idx}/{total}] Retry OAuth: {email}")
-            print(f"  password: {password[:4]}**** | mail_provider={mail_provider or '?'}")
-            print(f"{'='*60}")
+        _worker_log(
+            "\n".join([
+                f"{'='*60}",
+                f"  [{idx}/{total}] Retry OAuth: {email}",
+                f"  password: {password[:4]}**** | mail_provider={mail_provider or '?'}",
+                f"{'='*60}",
+            ]),
+            account=_mask_email(email),
+            step="retry_oauth",
+        )
 
         reg._print("[Retry] 开始执行 Codex OAuth (跳过注册阶段)")
         tokens = reg.perform_codex_oauth_login_http(email, password, mail_token=None)
@@ -2510,15 +2917,15 @@ def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, prox
 
         _save_codex_tokens(email, tokens)
         reg._print("[Retry] Token 已保存")
-        with _print_lock:
-            print(f"\n[OK] [{email}] OAuth 补救成功!")
+        _worker_log(f"[OK] [{email}] OAuth 补救成功!", level="success",
+                    account=_mask_email(email), step="done")
         return True, email, None
 
     except Exception as e:
         msg = str(e)
-        with _print_lock:
-            print(f"\n[FAIL] [{email}] retry 异常: {msg}")
-            traceback.print_exc()
+        _worker_log(f"[FAIL] [{email}] retry 异常: {msg}", level="error",
+                    account=_mask_email(email), step="failed")
+        _monitor_emit("system", traceback.format_exc(), level="error")
         return False, email, msg
     finally:
         if qq_pool and qq_addr:
@@ -2539,16 +2946,18 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
     """
     items, path = _read_pending_oauth(input_file)
     if not items:
-        print(f"[Retry] {path} 无可补救账号")
+        _console_log(f"[Retry] {path} 无可补救账号", level="warn")
         return
 
-    print(f"\n{'#'*60}")
-    print(f"  OAuth 补救模式")
-    print(f"  输入: {path} ({len(items)} 个账号)")
-    print(f"  并发: {max_workers}")
+    _console_block([
+        f"\n{'#'*60}",
+        "  OAuth 补救模式",
+        f"  输入: {path} ({len(items)} 个账号)",
+        f"  并发: {max_workers}",
+    ])
     if mail_provider_override:
-        print(f"  强制 mail_provider: {mail_provider_override}")
-    print(f"{'#'*60}\n")
+        _console_log(f"  强制 mail_provider: {mail_provider_override}")
+    _console_log(f"{'#'*60}\n")
 
     # 准备 QQ 池 (任何一行 mail_provider 是 domain_catchall, 或全局覆盖时)
     qq_pool = None
@@ -2557,14 +2966,19 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
     )
     if need_pool:
         if not HAS_DOMAIN_CATCHALL:
-            print("[Retry] ⚠️ 需要 QQ catch-all 但 config.json 未配置 qq_imap_user/authcode/mail_domain")
-            print("        将退化为手动 OTP 模式 (出现 OTP 时终端会 prompt)")
+            _console_block([
+                "[Retry] ⚠️ 需要 QQ catch-all 但 config.json 未配置 qq_imap_user/authcode/mail_domain",
+                "        将退化为手动 OTP 模式 (出现 OTP 时终端会 prompt)",
+            ], level="warn")
         elif _get_qq_mail_pool:
-            qq_pool = _get_qq_mail_pool(_CONFIG)
+            qq_pool = _get_qq_mail_pool(
+                _CONFIG,
+                log=monitor.channel("email") if monitor is not None else None,
+            )
             if qq_pool:
-                print(f"[Retry] QQ-CatchAll 池已就绪: {QQ_IMAP_USER}")
+                _console_log(f"[Retry] QQ-CatchAll 池已就绪: {QQ_IMAP_USER}", level="success")
             else:
-                print("[Retry] ⚠️ QQ 邮箱池初始化失败")
+                _console_log("[Retry] ⚠️ QQ 邮箱池初始化失败", level="error")
 
     success_emails = set()
     fail_emails = set()
@@ -2607,75 +3021,152 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
                     if raw in success_emails:
                         out.write(f"{email}----{password}----{email_pwd}----oauth=ok (retry)\n")
 
-    print(f"\n{'#'*60}")
-    print(f"  OAuth 补救完成")
-    print(f"  成功: {len(success_emails)} | 失败: {len(fail_emails)}")
-    print(f"  pending_oauth.txt 剩余: {len(remaining)}")
-    print(f"{'#'*60}\n")
+    _console_block([
+        f"\n{'#'*60}",
+        "  OAuth 补救完成",
+        f"  成功: {len(success_emails)} | 失败: {len(fail_emails)}",
+        f"  pending_oauth.txt 剩余: {len(remaining)}",
+        f"{'#'*60}\n",
+    ], level="success" if success_emails else "warn")
 
 
 def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
               max_workers=3, proxy=None, custom_email=None,
-              mail_provider="duckmail"):
+              mail_provider="duckmail", *, with_monitor_runtime=True):
     """并发批量注册
     mail_provider: "duckmail" | "domain_catchall" | "custom"
     """
 
+    requested_workers = 1 if (custom_email or mail_provider == "custom") else max_workers
+    actual_workers = min(requested_workers, total_accounts)
+    if with_monitor_runtime and monitor is not None:
+        _reset_run_metrics()
+        _intake_paused_event.clear()
+        _shutdown_event.clear()
+
+        def _run_callable():
+            return run_batch(
+                total_accounts=total_accounts,
+                output_file=output_file,
+                max_workers=max_workers,
+                proxy=proxy,
+                custom_email=custom_email,
+                mail_provider=mail_provider,
+                with_monitor_runtime=False,
+            )
+
+        result = monitor.run_with_monitor(
+            _run_callable,
+            tui_enabled=_is_tui_enabled(),
+            max_workers=max(1, actual_workers),
+            pool_getter=_get_phone_pool,
+            summary_getter=_summary_snapshot,
+            inflight_getter=_inflight_workers_snapshot,
+            intake_paused=_intake_paused_event,
+            shutdown_event=_shutdown_event,
+        )
+        summary = _summary_snapshot()
+        _console_log(
+            "summary:"
+            f" success={summary['success']}"
+            f" fail={summary['fail']}"
+            f" spent=${summary['spent']:.4f}"
+            f" dropped={monitor.stats().get('dropped_events', 0)}"
+            f" cap_skipped={summary['cap_skipped']}",
+            level="success" if summary["success"] else "warn",
+        )
+        return result
+
     if custom_email or mail_provider == "custom":
         mail_provider = "custom"
         if total_accounts != 1 or max_workers != 1:
-            print(f"[Info] 指定邮箱模式：强制 total_accounts=1, max_workers=1")
+            _system_log("[Info] 指定邮箱模式：强制 total_accounts=1, max_workers=1")
         total_accounts = 1
         max_workers = 1
     elif mail_provider == "domain_catchall":
         if not HAS_DOMAIN_CATCHALL:
-            print("❌ 错误: domain_catchall 模式需要在 config.json 配置:")
-            print("   qq_imap_user / qq_imap_authcode / mail_domain")
+            _system_log("❌ 错误: domain_catchall 模式需要在 config.json 配置:", level="error")
+            _system_log("   qq_imap_user / qq_imap_authcode / mail_domain", level="error")
             return
         # 预热池 (启动后台 IMAP 线程, 等基线 UID 拿到再开 worker)
         if _get_qq_mail_pool:
-            pool = _get_qq_mail_pool(_CONFIG)
+            pool = _get_qq_mail_pool(
+                _CONFIG,
+                log=monitor.channel("email") if monitor is not None else None,
+            )
             if not pool:
-                print("❌ 错误: QQ 邮箱池初始化失败")
+                _system_log("❌ 错误: QQ 邮箱池初始化失败", level="error")
                 return
-            print(f"[QQ-CatchAll] 池已就绪: {QQ_IMAP_USER} ← *@{MAIL_DOMAIN}")
+            _system_log(f"[QQ-CatchAll] 池已就绪: {QQ_IMAP_USER} ← *@{MAIL_DOMAIN}")
     elif not DUCKMAIL_BEARER:
-        print("❌ 错误: 未设置 DUCKMAIL_BEARER 环境变量")
-        print("   请设置: export DUCKMAIL_BEARER='your_api_key_here'")
-        print("   或: set DUCKMAIL_BEARER=your_api_key_here (Windows)")
+        _system_log("❌ 错误: 未设置 DUCKMAIL_BEARER 环境变量", level="error")
+        _system_log("   请设置: export DUCKMAIL_BEARER='your_api_key_here'", level="error")
+        _system_log("   或: set DUCKMAIL_BEARER=your_api_key_here (Windows)", level="error")
         return
 
     actual_workers = min(max_workers, total_accounts)
-    print(f"\n{'#'*60}")
+    if SENTINEL_INPROCESS:
+        sentinel_thread_overridden = SENTINEL_SOLVER_THREAD > 0
+        sentinel_thread = SENTINEL_SOLVER_THREAD if sentinel_thread_overridden else (actual_workers + 1)
+        _configure_inprocess_sentinel_runtime(thread=sentinel_thread, default_proxy=proxy)
+
+    _system_log(f"\n{'#'*60}")
     if mail_provider == "custom":
         mode_label = f"指定邮箱: {custom_email}"
     elif mail_provider == "domain_catchall":
         mode_label = f"自有域名 catch-all (*@{MAIL_DOMAIN} → QQ)"
     else:
         mode_label = "DuckMail 临时邮箱版"
-    print(f"  ChatGPT 批量自动注册 ({mode_label})")
-    print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
+    _system_log(f"  ChatGPT 批量自动注册 ({mode_label})")
+    _system_log(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
+    if SENTINEL_INPROCESS:
+        sentinel_note = "配置覆盖" if sentinel_thread_overridden else f"注册并发{actual_workers} + 1"
+        _system_log(f"  Sentinel池: {sentinel_thread} ({sentinel_note})")
     if mail_provider == "duckmail":
-        print(f"  DuckMail: {DUCKMAIL_API_BASE}")
-    print(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")
+        _system_log(f"  DuckMail: {DUCKMAIL_API_BASE}")
+    _system_log(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")
     if ENABLE_OAUTH:
-        print(f"  OAuth Issuer: {OAUTH_ISSUER}")
-        print(f"  OAuth Client: {OAUTH_CLIENT_ID}")
-        print(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
-    print(f"  输出文件: {output_file}")
-    print(f"{'#'*60}\n")
+        _system_log(f"  OAuth Issuer: {OAUTH_ISSUER}")
+        _system_log(f"  OAuth Client: {OAUTH_CLIENT_ID}")
+        _system_log(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
+    _system_log(
+        f"  PhonePool: max_workers={actual_workers} max_active={PHONE_MAX_ACTIVE or actual_workers} "
+        f"max_reuse={PHONE_MAX_REUSE} acquire_timeout={PHONE_ACQUIRE_TIMEOUT}"
+    )
+    _system_log(f"  输出文件: {output_file}")
+    _system_log(f"{'#'*60}\n")
 
     success_count = 0
     fail_count = 0
     start_time = time.time()
+    worker_slots: queue.Queue[str] = queue.Queue()
+    for i in range(actual_workers):
+        worker_slots.put(f"W{i + 1}")
+
+    def _worker_job(account_idx):
+        worker_id = worker_slots.get()
+        _mark_worker_active(worker_id)
+        if monitor is not None:
+            monitor.set_current_worker(worker_id)
+        try:
+            return _register_one(
+                account_idx, total_accounts, proxy, output_file,
+                custom_email, mail_provider,
+            )
+        finally:
+            if monitor is not None:
+                monitor.clear_current_worker()
+            _mark_worker_idle(worker_id)
+            worker_slots.put(worker_id)
 
     with ThreadPoolExecutor(max_workers=actual_workers) as executor:
         futures = {}
         for idx in range(1, total_accounts + 1):
-            future = executor.submit(
-                _register_one, idx, total_accounts, proxy, output_file,
-                custom_email, mail_provider,
-            )
+            while _intake_paused_event.is_set() and not _shutdown_event.is_set():
+                time.sleep(0.1)
+            if _shutdown_event.is_set():
+                break
+            future = executor.submit(_worker_job, idx)
             futures[future] = idx
 
         for future in as_completed(futures):
@@ -2684,23 +3175,31 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
                 ok, email, err = future.result()
                 if ok:
                     success_count += 1
+                    _bump_metric("success")
                 else:
                     fail_count += 1
-                    print(f"  [账号 {idx}] 失败: {err}")
+                    _bump_metric("fail")
+                    _system_log(f"  [账号 {idx}] 失败: {err}", level="error")
+                _bump_metric("done")
             except Exception as e:
                 fail_count += 1
-                with _print_lock:
-                    print(f"[FAIL] 账号 {idx} 线程异常: {e}")
+                _bump_metric("done")
+                _bump_metric("fail")
+                _system_log(f"[FAIL] 账号 {idx} 线程异常: {e}", level="error")
 
     elapsed = time.time() - start_time
     avg = elapsed / total_accounts if total_accounts else 0
-    print(f"\n{'#'*60}")
-    print(f"  注册完成! 耗时 {elapsed:.1f} 秒")
-    print(f"  总数: {total_accounts} | 成功: {success_count} | 失败: {fail_count}")
-    print(f"  平均速度: {avg:.1f} 秒/个")
+    pool = _get_phone_pool()
+    if pool is not None and hasattr(pool, "stats"):
+        with _run_metrics_lock:
+            _run_metrics["spent"] = float(pool.stats().get("spent", 0.0))
+    _system_log(f"\n{'#'*60}")
+    _system_log(f"  注册完成! 耗时 {elapsed:.1f} 秒")
+    _system_log(f"  总数: {total_accounts} | 成功: {success_count} | 失败: {fail_count}")
+    _system_log(f"  平均速度: {avg:.1f} 秒/个")
     if success_count > 0:
-        print(f"  结果文件: {output_file}")
-    print(f"{'#'*60}")
+        _system_log(f"  结果文件: {output_file}")
+    _system_log(f"{'#'*60}")
 
 
 def _parse_retry_oauth_args(argv):
@@ -2729,7 +3228,67 @@ def _parse_retry_oauth_args(argv):
     return input_file, max_workers, mail_provider_override
 
 
+def _parse_main_args(argv):
+    args = {
+        "mail_provider": None,
+        "email": None,
+        "proxy": None,
+        "count": None,
+        "workers": None,
+        "force_tui": False,
+        "force_no_tui": False,
+    }
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--mail-provider" and i + 1 < len(argv):
+            args["mail_provider"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if token == "--email" and i + 1 < len(argv):
+            args["email"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if token == "--proxy" and i + 1 < len(argv):
+            args["proxy"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if token == "--count" and i + 1 < len(argv):
+            try:
+                args["count"] = max(1, int(argv[i + 1]))
+            except ValueError:
+                pass
+            i += 2
+            continue
+        if token == "--workers" and i + 1 < len(argv):
+            try:
+                args["workers"] = max(1, int(argv[i + 1]))
+            except ValueError:
+                pass
+            i += 2
+            continue
+        if token == "--tui":
+            args["force_tui"] = True
+            i += 1
+            continue
+        if token == "--no-tui":
+            args["force_no_tui"] = True
+            i += 1
+            continue
+        i += 1
+    return args
+
+
 def main():
+    global _force_no_tui, _force_tui
+    main_args = _parse_main_args(sys.argv[1:])
+    if main_args["force_no_tui"]:
+        _force_no_tui = True
+        os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
+    if main_args["force_tui"]:
+        _force_tui = True
+        _force_no_tui = False
+        os.environ.pop("CHATGPT_REGISTER_NO_TUI", None)
     # CLI: 仅补救 OAuth (跳过整个注册菜单)
     retry_args = _parse_retry_oauth_args(sys.argv[1:])
     if retry_args is not None:
@@ -2739,9 +3298,9 @@ def main():
             or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY") \
             or os.environ.get("all_proxy") or None
         if proxy:
-            print(f"[Retry] 使用代理: {proxy}")
+            _console_log(f"[Retry] 使用代理: {proxy}")
         else:
-            print("[Retry] 不使用代理")
+            _console_log("[Retry] 不使用代理")
         retry_oauth_only(
             input_file=input_file,
             output_file=DEFAULT_OUTPUT_FILE,
@@ -2751,9 +3310,11 @@ def main():
         )
         return
 
-    print("=" * 60)
-    print("  ChatGPT 批量自动注册工具 (DuckMail 临时邮箱版)")
-    print("=" * 60)
+    _console_block([
+        "=" * 60,
+        "  ChatGPT 批量自动注册工具 (DuckMail 临时邮箱版)",
+        "=" * 60,
+    ])
 
     interactive = _is_interactive()
 
@@ -2761,17 +3322,32 @@ def main():
     if not skip_solver_check:
         ok, info = _check_sentinel_solver_health()
         if ok:
-            print(f"[Sentinel] solver 健康检查通过: {SENTINEL_SOLVER_URL} {info}")
+            mode = "in-process" if SENTINEL_INPROCESS else (SENTINEL_SOLVER_URL or "http")
+            _console_log(f"[Sentinel] solver 健康检查通过: {mode} {info}")
         else:
-            print(f"[Sentinel] ⚠️ solver 不可用: {info}")
-            print(f"           请先启动: python3 sentinel_solver.py --thread 2")
-            print(f"           或设置 SKIP_SOLVER_CHECK=1 强制跳过")
+            _console_log(f"[Sentinel] ⚠️ solver 不可用: {info}", level="error")
+            if SENTINEL_INPROCESS:
+                _console_log("           当前已配置为同进程模式，请检查 patchright/quart 依赖与浏览器可执行文件", level="warn")
+            else:
+                _console_log("           请先启动: python3 sentinel_solver.py --thread 2", level="warn")
+            _console_log("           或设置 SKIP_SOLVER_CHECK=1 强制跳过", level="warn")
             sys.exit(2)
 
     # 邮箱来源选择
-    custom_email = None
-    mail_provider = "duckmail"
-    if interactive:
+    custom_email = (main_args["email"] or "").strip() or None
+    mail_provider = (main_args["mail_provider"] or "").strip() or "duckmail"
+    if custom_email:
+        mail_provider = "custom"
+    if not custom_email and mail_provider == "custom":
+        if not interactive:
+            _console_log("[Error] --mail-provider custom 需要同时提供 --email", level="error")
+            sys.exit(2)
+        while True:
+            custom_email = input("请输入邮箱地址: ").strip()
+            if "@" in custom_email and "." in custom_email.split("@")[-1]:
+                break
+            _console_log("  邮箱格式无效，请重新输入", level="warn")
+    if not custom_email and main_args["mail_provider"] is None and interactive:
         catchall_hint = ""
         if HAS_DOMAIN_CATCHALL:
             catchall_hint = f"  [3] 自有域名 catch-all → QQ (*@{MAIL_DOMAIN})"
@@ -2789,41 +3365,50 @@ def main():
                 custom_email = input("请输入邮箱地址: ").strip()
                 if "@" in custom_email and "." in custom_email.split("@")[-1]:
                     break
-                print("  邮箱格式无效，请重新输入")
+                _console_log("  邮箱格式无效，请重新输入", level="warn")
         elif choice == "3":
             if not HAS_DOMAIN_CATCHALL:
-                print("[Error] 未在 config.json 配置 qq_imap_user/authcode/mail_domain, 回退到 DuckMail")
+                _console_log("[Error] 未在 config.json 配置 qq_imap_user/authcode/mail_domain, 回退到 DuckMail", level="error")
             else:
                 mail_provider = "domain_catchall"
         if custom_email:
-            print(f"[Info] 将使用指定邮箱: {custom_email}（OTP 需手动输入，仅注册 1 个账号）")
+            _console_log(f"[Info] 将使用指定邮箱: {custom_email}（OTP 需手动输入，仅注册 1 个账号）")
         elif mail_provider == "domain_catchall":
-            print(f"[Info] 将使用 catch-all 域名: *@{MAIL_DOMAIN} → {QQ_IMAP_USER}")
+            _console_log(f"[Info] 将使用 catch-all 域名: *@{MAIL_DOMAIN} → {QQ_IMAP_USER}")
+    elif custom_email:
+        _console_log(f"[Info] 将使用指定邮箱: {custom_email}（OTP 需手动输入，仅注册 1 个账号）")
+    elif mail_provider == "domain_catchall":
+        if not HAS_DOMAIN_CATCHALL:
+            _console_log("[Error] 未在 config.json 配置 qq_imap_user/authcode/mail_domain", level="error")
+            sys.exit(2)
+        _console_log(f"[Info] 将使用 catch-all 域名: *@{MAIL_DOMAIN} → {QQ_IMAP_USER}")
 
     # 检查 DuckMail 配置（仅在 DuckMail 模式下需要）
     if mail_provider == "duckmail" and not DUCKMAIL_BEARER:
-        print("\n⚠️  警告: 未设置 DUCKMAIL_BEARER")
-        print("   请编辑 config.json 设置 duckmail_bearer，或设置环境变量:")
-        print("   Windows: set DUCKMAIL_BEARER=your_api_key_here")
-        print("   Linux/Mac: export DUCKMAIL_BEARER='your_api_key_here'")
+        _console_block([
+            "\n⚠️  警告: 未设置 DUCKMAIL_BEARER",
+            "   请编辑 config.json 设置 duckmail_bearer，或设置环境变量:",
+            "   Windows: set DUCKMAIL_BEARER=your_api_key_here",
+            "   Linux/Mac: export DUCKMAIL_BEARER='your_api_key_here'",
+        ], level="warn")
         if interactive:
-            print("\n   按 Enter 继续尝试运行 (可能会失败)...")
+            _console_log("\n   按 Enter 继续尝试运行 (可能会失败)...", level="warn")
             input()
         else:
-            print("   当前为非交互环境，继续按默认配置执行。")
+            _console_log("   当前为非交互环境，继续按默认配置执行。", level="warn")
 
     # 交互式代理配置
-    proxy = DEFAULT_PROXY
+    proxy = main_args["proxy"] if main_args["proxy"] is not None else DEFAULT_PROXY
     env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
              or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-    if interactive:
+    if main_args["proxy"] is None and interactive:
         if proxy:
-            print(f"[Info] 检测到默认代理: {proxy}")
+            _console_log(f"[Info] 检测到默认代理: {proxy}")
             use_default = input("使用此代理? (Y/n): ").strip().lower()
             if use_default == "n":
                 proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
         elif env_proxy:
-            print(f"[Info] 检测到环境变量代理: {env_proxy}")
+            _console_log(f"[Info] 检测到环境变量代理: {env_proxy}")
             use_env = input("使用此代理? (Y/n): ").strip().lower()
             if use_env == "n":
                 proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
@@ -2833,23 +3418,26 @@ def main():
             proxy = input("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理): ").strip() or None
     else:
         if proxy:
-            print(f"[Info] 非交互环境，使用 config.json 中的代理: {proxy}")
+            _console_log(f"[Info] 非交互环境，使用 config.json 中的代理: {proxy}")
         elif env_proxy:
             proxy = env_proxy
-            print(f"[Info] 非交互环境，使用环境变量代理: {proxy}")
+            _console_log(f"[Info] 非交互环境，使用环境变量代理: {proxy}")
         else:
             proxy = None
-            print("[Info] 非交互环境，未检测到代理配置")
+            _console_log("[Info] 非交互环境，未检测到代理配置", level="warn")
 
     if proxy:
-        print(f"[Info] 使用代理: {proxy}")
+        _console_log(f"[Info] 使用代理: {proxy}")
     else:
-        print("[Info] 不使用代理")
+        _console_log("[Info] 不使用代理", level="warn")
 
     # 输入注册数量（指定邮箱模式跳过，只注册 1 个）
     if custom_email:
         total_accounts = 1
         max_workers = 1
+    elif main_args["count"] is not None or main_args["workers"] is not None:
+        total_accounts = main_args["count"] or DEFAULT_TOTAL_ACCOUNTS
+        max_workers = main_args["workers"] or DEFAULT_MAX_WORKERS
     elif interactive:
         count_input = input(f"\n注册账号数量 (默认 {DEFAULT_TOTAL_ACCOUNTS}): ").strip()
         total_accounts = int(count_input) if count_input.isdigit() and int(count_input) > 0 else DEFAULT_TOTAL_ACCOUNTS
@@ -2859,8 +3447,12 @@ def main():
     else:
         total_accounts = DEFAULT_TOTAL_ACCOUNTS
         max_workers = DEFAULT_MAX_WORKERS
-        print(f"[Info] 非交互环境，注册数量: {total_accounts}")
-        print(f"[Info] 非交互环境，并发数: {max_workers}")
+        _console_log(f"[Info] 非交互环境，注册数量: {total_accounts}")
+        _console_log(f"[Info] 非交互环境，并发数: {max_workers}")
+
+    if total_accounts <= 1 and not _force_tui:
+        _force_no_tui = True
+        os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
 
     run_batch(total_accounts=total_accounts, output_file=DEFAULT_OUTPUT_FILE,
               max_workers=max_workers, proxy=proxy, custom_email=custom_email,

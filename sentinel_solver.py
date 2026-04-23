@@ -12,10 +12,16 @@ import os
 import sys
 import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from patchright.async_api import async_playwright
-from quart import Quart, jsonify, request
+
+try:
+    from quart import Quart, jsonify, request
+except Exception:
+    Quart = None
+    jsonify = None
+    request = None
 
 from browser_configs import browser_config
 
@@ -79,25 +85,65 @@ def _fmt(level, color, msg):
     return f"[{ts}] [{COLORS[color]}{level}{COLORS['RESET']}] -> {msg}"
 
 
-class _Logger(logging.Logger):
-    def info(self, msg, *a, **kw): super().info(_fmt("INFO", "BLUE", msg), *a, **kw)
-    def success(self, msg, *a, **kw): super().info(_fmt("SUCCESS", "GREEN", msg), *a, **kw)
-    def warning(self, msg, *a, **kw): super().warning(_fmt("WARN", "YELLOW", msg), *a, **kw)
-    def error(self, msg, *a, **kw): super().error(_fmt("ERROR", "RED", msg), *a, **kw)
-    def debug(self, msg, *a, **kw): super().debug(_fmt("DEBUG", "MAGENTA", msg), *a, **kw)
+class _LogProxy:
+    def __init__(self, base_logger):
+        self._base = base_logger
+
+    def setLevel(self, level):
+        self._base.setLevel(level)
+
+    def info(self, msg, *a, **kw):
+        self._base.info(_fmt("INFO", "BLUE", msg), *a, **kw)
+
+    def success(self, msg, *a, **kw):
+        self._base.info(_fmt("SUCCESS", "GREEN", msg), *a, **kw)
+
+    def warning(self, msg, *a, **kw):
+        self._base.warning(_fmt("WARN", "YELLOW", msg), *a, **kw)
+
+    def error(self, msg, *a, **kw):
+        self._base.error(_fmt("ERROR", "RED", msg), *a, **kw)
+
+    def debug(self, msg, *a, **kw):
+        self._base.debug(_fmt("DEBUG", "MAGENTA", msg), *a, **kw)
 
 
-logging.setLoggerClass(_Logger)
-logger = logging.getLogger("SentinelSolver")
-logger.setLevel(logging.INFO)
-_h = logging.StreamHandler(sys.stdout)
-logger.addHandler(_h)
+class _CallbackLogger:
+    def __init__(self, callback: Callable[[str], None]):
+        self._callback = callback
+
+    def setLevel(self, level):
+        return None
+
+    def info(self, msg, *a, **kw):
+        self._callback(str(msg))
+
+    def warning(self, msg, *a, **kw):
+        self._callback(str(msg))
+
+    def error(self, msg, *a, **kw):
+        self._callback(str(msg))
+
+    def debug(self, msg, *a, **kw):
+        self._callback(str(msg))
+
+
+_base_logger = logging.getLogger("SentinelSolver")
+if not _base_logger.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(message)s"))
+    _base_logger.addHandler(_h)
+_base_logger.setLevel(logging.INFO)
+_base_logger.propagate = False
+logger = _LogProxy(_base_logger)
 
 
 class SentinelSolver:
     def __init__(self, headless: bool, thread: int, debug: bool, channel: str,
-                 default_proxy: Optional[str] = None):
-        self.app = Quart(__name__)
+                 default_proxy: Optional[str] = None, enable_http: bool = True,
+                 log: Optional[Callable[[str], None]] = None):
+        global logger
+        self.app = None
         self.headless = headless
         self.thread = thread
         self.debug = debug
@@ -107,65 +153,114 @@ class SentinelSolver:
         self.resource_cache = {}
         self.busy = 0
         self._playwright = None
+        self._started = False
+        self._start_lock = asyncio.Lock()
+
+        if log is not None:
+            logger = _LogProxy(_CallbackLogger(log))
 
         if self.debug:
             logger.setLevel(logging.DEBUG)
 
+        if enable_http:
+            self._setup_http_routes()
+
+    def _setup_http_routes(self):
+        if Quart is None:
+            raise RuntimeError("quart 未安装，无法启用 HTTP 模式")
+        self.app = Quart(__name__)
         self.app.before_serving(self._startup)
+        self.app.after_serving(self._shutdown)
         self.app.route("/sentinel/token", methods=["POST"])(self.solve)
         self.app.route("/health", methods=["GET"])(self.health)
         # 同步 Turnstile 接口：POST {url,sitekey,...} → {token}（统一到这个服务）
         self.app.route("/turnstile/token", methods=["POST"])(self.solve_turnstile)
 
     async def _startup(self):
-        logger.info(f"启动 Patchright {self.channel} 浏览器池, thread={self.thread}, headless={self.headless}")
-        self._playwright = await async_playwright().start()
-        for i in range(self.thread):
-            try:
-                browser = await self._playwright.chromium.launch(
-                    channel=self.channel,
-                    headless=self.headless,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-            except Exception as e:
-                logger.warning(f"channel={self.channel} 启动失败: {e}; 回退到默认 chromium")
-                browser = await self._playwright.chromium.launch(
-                    headless=self.headless,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-            await self.browser_pool.put((i + 1, browser))
-            logger.info(f"Browser #{i + 1} 就绪")
-        logger.success(f"浏览器池初始化完成, size={self.browser_pool.qsize()}")
+        async with self._start_lock:
+            if self._started:
+                return
+            logger.info(f"启动 Patchright {self.channel} 浏览器池, thread={self.thread}, headless={self.headless}")
+            self._playwright = await async_playwright().start()
+            for i in range(self.thread):
+                try:
+                    browser = await self._playwright.chromium.launch(
+                        channel=self.channel,
+                        headless=self.headless,
+                        args=["--disable-blink-features=AutomationControlled"],
+                    )
+                except Exception as e:
+                    logger.warning(f"channel={self.channel} 启动失败: {e}; 回退到默认 chromium")
+                    browser = await self._playwright.chromium.launch(
+                        headless=self.headless,
+                        args=["--disable-blink-features=AutomationControlled"],
+                    )
+                await self.browser_pool.put((i + 1, browser))
+                logger.info(f"Browser #{i + 1} 就绪")
+            logger.success(f"浏览器池初始化完成, size={self.browser_pool.qsize()}")
+            self._started = True
 
-    async def health(self):
-        return jsonify({
+    async def _shutdown(self):
+        async with self._start_lock:
+            if not self._started:
+                return
+            while not self.browser_pool.empty():
+                _, browser = await self.browser_pool.get()
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if self._playwright is not None:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+            self._playwright = None
+            self._started = False
+
+    async def ensure_started(self):
+        await self._startup()
+
+    async def health_data(self):
+        await self.ensure_started()
+        return {
             "ok": True,
             "pool_size": self.thread,
             "available": self.browser_pool.qsize(),
             "busy": self.busy,
-        })
+            "mode": "inprocess" if self.app is None else "http",
+        }
+
+    async def health(self):
+        return jsonify(await self.health_data())
 
     async def solve(self):
         try:
             payload = await request.get_json(force=True)
         except Exception:
             return jsonify({"error": "invalid json"}), 400
+        token, err = await self.solve_token(
+            flow=(payload or {}).get("flow"),
+            oai_did=(payload or {}).get("oai_did"),
+            ua=(payload or {}).get("user_agent"),
+            proxy=(payload or {}).get("proxy"),
+        )
+        if token:
+            return jsonify({"token": token})
+        return jsonify({"error": err or "unknown"}), 500
 
-        flow = (payload or {}).get("flow") or DEFAULT_FLOW
-        oai_did = (payload or {}).get("oai_did") or str(uuid.uuid4())
-        ua = (payload or {}).get("user_agent")
-        proxy = (payload or {}).get("proxy") or self.default_proxy
+    async def solve_token(self, flow=None, oai_did=None, ua=None, proxy=None):
+        await self.ensure_started()
+        flow = flow or DEFAULT_FLOW
+        oai_did = oai_did or str(uuid.uuid4())
+        proxy = proxy or self.default_proxy
 
         if not ua:
             _, _, ua, _ = browser_config.get_random_browser_config("chromium")
 
         req_id = uuid.uuid4().hex[:8]
         logger.info(f"[{req_id}] 收到请求 flow={flow} oai_did={oai_did[:8]}… proxy={proxy or '-'}")
-
-        token, err = await self._do_solve(req_id, flow, oai_did, ua, proxy)
-        if token:
-            return jsonify({"token": token})
-        return jsonify({"error": err or "unknown"}), 500
+        return await self._do_solve(req_id, flow, oai_did, ua, proxy)
 
     async def _do_solve(self, req_id, flow, oai_did, ua, proxy=None):
         import re as _re
@@ -393,16 +488,26 @@ class SentinelSolver:
         sitekey = (payload or {}).get("sitekey")
         action = (payload or {}).get("action")
         cdata = (payload or {}).get("cdata")
-        proxy = (payload or {}).get("proxy") or self.default_proxy
         if not url or not sitekey:
             return jsonify({"error": "url and sitekey are required"}), 400
 
-        req_id = uuid.uuid4().hex[:8]
-        logger.info(f"[ts-{req_id}] 收到请求 url={url[:80]} sitekey={sitekey} proxy={proxy or '-'}")
-        token, err = await self._do_turnstile(req_id, url, sitekey, action, cdata, proxy)
+        token, err = await self.solve_turnstile_token(
+            url=url,
+            sitekey=sitekey,
+            action=action,
+            cdata=cdata,
+            proxy=(payload or {}).get("proxy"),
+        )
         if token:
             return jsonify({"token": token})
         return jsonify({"error": err or "unknown"}), 500
+
+    async def solve_turnstile_token(self, url, sitekey, action=None, cdata=None, proxy=None):
+        await self.ensure_started()
+        req_id = uuid.uuid4().hex[:8]
+        proxy = proxy or self.default_proxy
+        logger.info(f"[ts-{req_id}] 收到请求 url={url[:80]} sitekey={sitekey} proxy={proxy or '-'}")
+        return await self._do_turnstile(req_id, url, sitekey, action, cdata, proxy)
 
     async def _do_turnstile(self, req_id, url, sitekey, action, cdata, proxy):
         """从 D3vin/Turnstile-Solver-NEW 移植：导航 → 等 input[name=cf-turnstile-response] 填充。"""

@@ -30,6 +30,7 @@ import time
 import re
 import random
 import ssl
+from typing import Callable, Optional
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
@@ -148,7 +149,8 @@ def extract_otp(content: str):
 
 class QQMailPool:
     def __init__(self, host, port, user, authcode, domain,
-                 poll_interval=4, debug=False, folder="INBOX"):
+                 poll_interval=4, debug=False, folder="INBOX",
+                 log: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = int(port)
         self.user = user
@@ -157,6 +159,7 @@ class QQMailPool:
         self.poll_interval = max(1, int(poll_interval))
         self.debug = bool(debug)
         self.folder = folder or "INBOX"
+        self.log = log
 
         # 收件箱: address(lower) -> [{uid, ts, subject, from, body}, ...] (新→旧)
         self._inbox = {}
@@ -579,7 +582,10 @@ class QQMailPool:
 
     def _log(self, msg):
         if self.debug:
-            print(f"[QQMailPool] {msg}")
+            if self.log:
+                self.log(f"[QQMailPool] {msg}")
+            else:
+                print(f"[QQMailPool] {msg}")
 
 
 # ---- 单例 ----
@@ -588,7 +594,7 @@ _pool_instance = None
 _pool_init_lock = threading.Lock()
 
 
-def get_pool(config=None):
+def get_pool(config=None, log: Optional[Callable[[str], None]] = None):
     """根据 config 拿到全局唯一池, 第一次调用时创建并启动"""
     global _pool_instance
     if _pool_instance is not None:
@@ -612,6 +618,7 @@ def get_pool(config=None):
             poll_interval=config.get("mail_poll_interval", 4),
             debug=bool(config.get("mail_debug", False)),
             folder=config.get("qq_imap_folder", "INBOX"),
+            log=log,
         )
         pool.start()
         _pool_instance = pool

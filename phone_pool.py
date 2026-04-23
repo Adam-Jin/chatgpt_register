@@ -98,6 +98,13 @@ class LeaseLost(SmsProviderError):
     """续租失败 (被别的进程抢了或行被清). 主流程应当立刻退出本次复用。"""
 
 
+class PhonePoolCapacityExhausted(Exception):
+    def __init__(self, current_active: int, max_active: int):
+        super().__init__(f"phone pool active cap exhausted: {current_active}/{max_active}")
+        self.current_active = current_active
+        self.max_active = max_active
+
+
 # ============================================================
 # 数据结构
 # ============================================================
@@ -176,6 +183,8 @@ class PhoneLease:
             ok = self.pool._renew_lease(self.activation_id, self.pool.owner_id)
             if not ok:
                 self._lease_lost = True
+                self.pool._unregister_lease_worker(self.activation_id)
+                self.pool._notify_cap()
                 return
 
     def mark_used(self, sms_id: str, code: str, account_id: Optional[str] = None):
@@ -206,6 +215,8 @@ class PhonePool:
     def __init__(self, provider, *,
                  db_path: str = DB_PATH,
                  max_reuse: int = DEFAULT_MAX_REUSE,
+                 max_active: int = 0,
+                 acquire_timeout: float = 60.0,
                  lease_seconds: int = DEFAULT_LEASE_SECONDS,
                  heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
                  log: Callable[[str], None] = print):
@@ -215,10 +226,18 @@ class PhonePool:
         self.provider = provider
         self.db_path = db_path
         self.max_reuse = int(max_reuse)
+        self.max_active = int(max_active)
+        self.acquire_timeout = float(acquire_timeout)
         self.lease_seconds = int(lease_seconds)
         self.heartbeat_seconds = int(heartbeat_seconds)
         self.log = log
         self.owner_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._cap_cond = threading.Condition()
+        self.cap_waiters = 0
+        self._state_lock = threading.Lock()
+        self._fresh_total = 0
+        self._reuse_total = 0
+        self._lease_workers: dict[str, Optional[str]] = {}
         self._init_db()
 
     # ---------- DB plumbing ----------
@@ -271,6 +290,7 @@ class PhonePool:
                         for r in (remote or []) if isinstance(r, dict)}
 
         to_finish: list[str] = []
+        cap_changed = False
 
         with self._conn(immediate=True) as c:
             # A. 云端有的: 按 estDate 分活/死
@@ -312,6 +332,8 @@ class PhonePool:
                             "can_get_another=0, "
                             "lease_owner=NULL, lease_until=NULL "
                             "WHERE activation_id=?", (aid,))
+                        self._unregister_lease_worker(aid)
+                        cap_changed = True
                     else:
                         c.execute(
                             "INSERT INTO phone_pool (activation_id, phone_number, "
@@ -336,6 +358,8 @@ class PhonePool:
                         "UPDATE phone_pool SET status='expired', "
                         "lease_owner=NULL, lease_until=NULL "
                         "WHERE activation_id=?", (aid,))
+                    self._unregister_lease_worker(aid)
+                    cap_changed = True
                     self.log(f"[phone_pool] reconcile -gone {aid} "
                              f"(云端已无)")
 
@@ -346,6 +370,8 @@ class PhonePool:
                 self.log(f"[phone_pool] finishActivation {aid} ok")
             except Exception as e:
                 self.log(f"[phone_pool] finishActivation {aid} 失败 (忽略): {e}")
+        if cap_changed:
+            self._notify_cap()
 
     def acquire_or_reuse(self, **acquire_kwargs) -> PhoneLease:
         """优先复用; 没可复用号或抢不到时 fallback 到 provider.acquire().
@@ -361,7 +387,34 @@ class PhonePool:
                 f"{self.max_reuse}")
             return reused
 
+        if self.max_active > 0:
+            deadline = time.time() + self.acquire_timeout
+            with self._cap_cond:
+                while True:
+                    reused = self._try_claim_reused()
+                    if reused is not None:
+                        self.log(
+                            f"[phone_pool] REUSE activation={reused.activation_id} "
+                            f"number={reused.phone_number} used_count={reused.used_count}/"
+                            f"{self.max_reuse}")
+                        return reused
+                    with self._conn() as c:
+                        active = self._count_active_locked(c)
+                    if active < self.max_active:
+                        return self._acquire_fresh(**acquire_kwargs)
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        raise PhonePoolCapacityExhausted(active, self.max_active)
+                    self.cap_waiters += 1
+                    try:
+                        self._cap_cond.wait(timeout=min(remain, 5.0))
+                    finally:
+                        self.cap_waiters = max(0, self.cap_waiters - 1)
+
         # fallback: 拿全新号入池
+        return self._acquire_fresh(**acquire_kwargs)
+
+    def _acquire_fresh(self, **acquire_kwargs) -> PhoneLease:
         sess = self.provider.acquire(**acquire_kwargs)
         now = int(time.time())
         end_at = self._parse_end_at(sess.extra.get("activationEndTime"), now)
@@ -376,12 +429,15 @@ class PhonePool:
                  sess.extra.get("service") or acquire_kwargs.get("service"),
                  sess.cost, now, end_at, 0, "fresh",
                  self.owner_id, now + self.lease_seconds, 1))
+        with self._state_lock:
+            self._fresh_total += 1
         lease = PhoneLease(
             pool=self, activation_id=sess.handle,
             phone_number=str(sess.number), cost=sess.cost or 0,
             used_count=0, is_reused=False, locale=sess.locale,
             end_at=end_at, extra=dict(sess.extra),
         )
+        self._register_lease_worker(lease.activation_id)
         self.log(f"[phone_pool] FRESH activation={lease.activation_id} "
                  f"number={lease.phone_number} cost=${lease.cost}")
         return lease
@@ -392,6 +448,45 @@ class PhonePool:
                 "SELECT sms_id FROM phone_pool_sms WHERE activation_id=?",
                 (activation_id,))
             return {r["sms_id"] for r in cur.fetchall()}
+
+    def stats(self) -> dict[str, Any]:
+        now = int(time.time())
+        with self._conn() as c:
+            active = self._count_active_locked(c)
+            spent_row = c.execute(
+                "SELECT COALESCE(SUM(cost), 0) AS spent FROM phone_pool"
+            ).fetchone()
+            lease_rows = c.execute(
+                "SELECT activation_id, phone_number, used_count, status "
+                "FROM phone_pool WHERE lease_owner=? AND (lease_until IS NULL OR lease_until > ?)",
+                (self.owner_id, now),
+            ).fetchall()
+        with self._state_lock:
+            fresh_total = self._fresh_total
+            reuse_total = self._reuse_total
+            lease_workers = dict(self._lease_workers)
+        total = fresh_total + reuse_total
+        reuse_rate = (reuse_total / total) if total else 0.0
+        leases = []
+        for row in lease_rows:
+            leases.append({
+                "worker_id": lease_workers.get(row["activation_id"]),
+                "activation_id": row["activation_id"],
+                "phone_number": row["phone_number"],
+                "used_count": int(row["used_count"] or 0),
+                "max_reuse": self.max_reuse,
+                "is_reused": row["status"] == "reused",
+            })
+        return {
+            "active": int(active),
+            "max_active": self.max_active,
+            "fresh_total": fresh_total,
+            "reuse_total": reuse_total,
+            "reuse_rate": reuse_rate,
+            "spent": float(spent_row["spent"] or 0.0),
+            "leases": leases,
+            "cap_waiters": self.cap_waiters,
+        }
 
     # ---------- 内部: lease + state ----------
 
@@ -446,7 +541,9 @@ class PhonePool:
                 (self.owner_id, new_lease_until, row["activation_id"], now))
             if cur.rowcount == 0:
                 return None
-        return PhoneLease(
+        with self._state_lock:
+            self._reuse_total += 1
+        lease = PhoneLease(
             pool=self, activation_id=row["activation_id"],
             phone_number=row["phone_number"], cost=float(row["cost"] or 0),
             used_count=int(row["used_count"]), is_reused=True,
@@ -454,6 +551,8 @@ class PhonePool:
             end_at=row["end_at"],
             extra={"service": row["service"]},
         )
+        self._register_lease_worker(lease.activation_id)
+        return lease
 
     def _renew_lease(self, activation_id: str, owner: str) -> bool:
         """心跳续租. 返回 False 表示我已经被抢走."""
@@ -468,10 +567,13 @@ class PhonePool:
 
     def _release_lease(self, activation_id: str, owner: str):
         with self._conn(immediate=True) as c:
-            c.execute(
+            cur = c.execute(
                 "UPDATE phone_pool SET lease_owner=NULL, lease_until=NULL "
                 "WHERE activation_id=? AND lease_owner=?",
                 (activation_id, owner))
+        self._unregister_lease_worker(activation_id)
+        if cur.rowcount:
+            self._notify_cap()
 
     def _mark_used(self, lease: PhoneLease, sms_id: str, code: str,
                    account_id: Optional[str]):
@@ -497,6 +599,8 @@ class PhonePool:
         self.log(f"[phone_pool] mark_used activation={lease.activation_id} "
                  f"used_count={new_count}/{self.max_reuse}"
                  + (" FINISHED" if finished else ""))
+        self._unregister_lease_worker(lease.activation_id)
+        self._notify_cap()
         if finished:
             try:
                 self.provider.release_ok(lease.to_session())
@@ -512,6 +616,8 @@ class PhonePool:
                 "lease_owner=NULL, lease_until=NULL "
                 "WHERE activation_id=? AND lease_owner=?",
                 (reason, lease.activation_id, self.owner_id))
+        self._unregister_lease_worker(lease.activation_id)
+        self._notify_cap()
         self.log(f"[phone_pool] mark_dead activation={lease.activation_id} "
                  f"reason={reason}")
         # 试着退款 (cancel). hero-sms <120s 强制不让 cancel, 失败就让它过期
@@ -534,6 +640,36 @@ class PhonePool:
             return int(datetime.fromisoformat(txt).timestamp())
         except Exception:
             return now + 20 * 60
+
+    def _count_active_locked(self, c) -> int:
+        now = int(time.time())
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM phone_pool "
+            "WHERE status IN ('fresh','reused') AND (end_at IS NULL OR end_at > ?)",
+            (now,),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def _register_lease_worker(self, activation_id: str) -> None:
+        with self._state_lock:
+            self._lease_workers[activation_id] = self._current_worker_id()
+
+    def _unregister_lease_worker(self, activation_id: str) -> None:
+        with self._state_lock:
+            self._lease_workers.pop(activation_id, None)
+
+    def _notify_cap(self) -> None:
+        with self._cap_cond:
+            self._cap_cond.notify_all()
+
+    @staticmethod
+    def _current_worker_id() -> Optional[str]:
+        try:
+            from monitor import current_worker_id
+
+            return current_worker_id()
+        except Exception:
+            return None
 
     # hero-sms 背后是 sms-activate 协议, 时间戳用莫斯科时间 (UTC+3, 无 DST)
     HEROSMS_TZ_OFFSET_HOURS = 3
@@ -575,6 +711,8 @@ def _build_pool(cfg):
     return PhonePool(
         provider,
         max_reuse=int(cfg.get("phone_max_reuse", DEFAULT_MAX_REUSE)),
+        max_active=int(cfg.get("phone_max_active", 0) or 0),
+        acquire_timeout=float(cfg.get("phone_acquire_timeout", 60.0)),
         lease_seconds=int(cfg.get("phone_pool_lease_seconds",
                                   DEFAULT_LEASE_SECONDS)),
         heartbeat_seconds=int(cfg.get("phone_pool_heartbeat_seconds",
@@ -637,16 +775,18 @@ def cmd_prune(args, cfg):
 
 def cmd_stats(args, cfg):
     pool = _build_pool(cfg)
+    snapshot = pool.stats()
     with pool._conn() as c:
         row = c.execute(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(cost),0) AS spent, "
-            "       COALESCE(SUM(used_count),0) AS accounts "
+            "SELECT COUNT(*) AS n, COALESCE(SUM(used_count),0) AS accounts "
             "FROM phone_pool").fetchone()
-    n, spent, accounts = row["n"], float(row["spent"]), int(row["accounts"])
+    n, spent, accounts = row["n"], float(snapshot["spent"]), int(row["accounts"])
     avg = spent / accounts if accounts else 0
     print(f"numbers   : {n}")
     print(f"accounts  : {accounts}  (used_count 累计)")
     print(f"spent     : ${spent:.4f}")
+    print(f"active    : {snapshot['active']} / {snapshot['max_active']}")
+    print(f"reuse     : {snapshot['reuse_total']} ({snapshot['reuse_rate']*100:.1f}%)")
     print(f"avg/acc   : ${avg:.4f}  (vs 单号单账号 ${spent/n if n else 0:.4f})")
 
 
