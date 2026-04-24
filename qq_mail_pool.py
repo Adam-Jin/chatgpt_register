@@ -35,6 +35,8 @@ from typing import Callable, Optional
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
+from log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
+
 
 class _IdleUnsupportedError(RuntimeError):
     """IMAP server does not support IDLE and should fall back to polling."""
@@ -156,7 +158,8 @@ class QQMailPool:
     def __init__(self, host, port, user, authcode, domain,
                  poll_interval=4, debug=False, folder="INBOX",
                  security="auto",
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None,
+                 log_level: Optional[str] = None):
         self.host = host
         self.port = int(port)
         self.user = user
@@ -164,6 +167,7 @@ class QQMailPool:
         self.domain = domain.lower().lstrip("@")
         self.poll_interval = max(1, int(poll_interval))
         self.debug = bool(debug)
+        self.log_level = normalize_log_level(log_level, default="debug" if self.debug else DEFAULT_LOG_LEVEL)
         self.folder = folder or "INBOX"
         self.security = str(security or "auto").strip().lower() or "auto"
         self.log = log
@@ -703,11 +707,17 @@ class QQMailPool:
     # ---- 日志 ----
 
     def _log(self, msg):
-        if self.debug:
-            if self.log:
-                self.log(f"[QQMailPool] {msg}")
-            else:
-                print(f"[QQMailPool] {msg}")
+        if not should_log("debug", self.log_level):
+            return
+        line = f"[QQMailPool] {msg}"
+        if self.log:
+            try:
+                self.log(line, level="debug")
+                return
+            except TypeError:
+                self.log(line)
+                return
+        print(line)
 
 
 # ---- 池缓存 ----
@@ -851,6 +861,7 @@ def get_pool(config=None, log: Optional[Callable[[str], None]] = None):
             folder=folder,
             security=security,
             log=log,
+            log_level=("debug" if bool(config.get("mail_debug", False)) else config.get("log_level")),
         )
         pool.start()
         _pool_instances[cache_key] = pool

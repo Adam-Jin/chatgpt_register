@@ -4,7 +4,7 @@ herosms_pool.py - hero-sms.com (sms-activate 兼容协议) 接码 provider。
 
 API: https://hero-sms.com/stubs/handler_api.php
 计费模型: getNumber 立即冻结 activationCost; cancel 全退; finish/超时 真扣。
-默认: country=52 (Thailand), service=oai (OpenAI/ChatGPT), maxPrice=$0.05。
+默认: country=52 (Thailand), service=dr (OpenAI/ChatGPT), maxPrice=$0.05。
 
 CLI:
   verify              校对 country/service ID (打印 Thailand & OpenAI 候选)
@@ -43,6 +43,7 @@ HEROSMS_API = "https://hero-sms.com/stubs/handler_api.php"
 DEFAULT_COUNTRY = 52       # Thailand (sms-activate 标准, verify 命令可校对)
 DEFAULT_SERVICE = "dr"     # OpenAI/ChatGPT (hero-sms 的 code; 非 sms-activate 标准 "oai")
 DEFAULT_MAX_PRICE = 0.05   # USD
+DEFAULT_FIXED_PRICE = True
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
@@ -134,6 +135,12 @@ def cheapest_price(prices: dict) -> Optional[tuple[str, float, int]]:
             if best is None or c < best[1]:
                 best = (f"{c_id}/{svc_code}", c, int(count))
     return best
+
+
+def _format_price(value: float) -> str:
+    """价格日志尽量保留有效精度, 避免 0.05004 被显示成 0.0500 造成误判。"""
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def get_countries(api_key: str) -> list[dict]:
@@ -317,22 +324,25 @@ class HeroSmsProvider(SmsProvider):
         self.default_service = cfg.get("herosms_service", DEFAULT_SERVICE)
         self.default_max_price = float(
             cfg.get("herosms_max_price", DEFAULT_MAX_PRICE))
+        self.default_fixed_price = bool(
+            cfg.get("herosms_fixed_price", DEFAULT_FIXED_PRICE))
 
     # ---- SmsProvider 接口 ----
 
     def acquire(self, *, country: Optional[int] = None,
                 service: Optional[str] = None,
                 max_price: Optional[float] = None,
-                fixed_price: bool = True,
+                fixed_price: Optional[bool] = None,
                 operator: Optional[str] = None,
                 phone_exception: Optional[str] = None,
                 **_) -> SmsSession:
         c = int(country) if country is not None else self.default_country
         s = service or self.default_service
         mp = self.default_max_price if max_price is None else float(max_price)
+        fp = self.default_fixed_price if fixed_price is None else bool(fixed_price)
         try:
             info = get_number_v2(self.api_key, service=s, country=c,
-                                 max_price=mp, fixed_price=fixed_price,
+                                 max_price=mp, fixed_price=fp,
                                  operator=operator,
                                  phone_exception=phone_exception)
         except NoNumberAvailable:
@@ -344,14 +354,18 @@ class HeroSmsProvider(SmsProvider):
                 best = None
             hint = ""
             if best:
-                op, cost, cnt = best
-                hint = (f"; 当前最低 ${cost:.4f} (operator={op}, 库存={cnt});"
-                        f" 建议提高 max_price 或换 country/service")
+                route, cost, cnt = best
+                hint = (f"; getPrices 当前最低报价 ${_format_price(cost)} "
+                        f"(route={route}, 库存={cnt})")
+                if abs(cost - mp) <= 1e-6:
+                    hint += ("; 这是贴边价, getPrices 与 getNumberV2 可能因"
+                             "瞬时库存或更高精度报价不一致")
+                hint += "; 建议提高 max_price 或换 country/service"
             else:
                 hint = "; getPrices 也没拿到任何报价, 建议换 country/service"
             raise NoNumberAvailable(
                 f"hero-sms 没有满足 service={s} country={c} "
-                f"maxPrice=${mp} 的号{hint}"
+                f"maxPrice=${_format_price(mp)} 的号{hint}"
             )
         return SmsSession(
             provider=self.name,

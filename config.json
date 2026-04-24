@@ -52,9 +52,9 @@
       "name": "addy.io 1033052348@qq.com",
       "type": "addy",
       "domain": "anonaddy.me",
-      "api_key": "addy_io_69YFQG7Kz2AtMGrPD3L2k4pbKZBgB30sMBN9pSdR2c04c4d6",
+      "api_key": "addy_io_ZvD4Q2j0b54sVhDKC59Q6gE12Usc7olJR8ymR1ud4d3d001e",
       "receiver": "qq-main",
-      "recipient_ids": ["ead0c453-0899-490f-a362-b7a2f4b8cd37"],
+      "recipient_ids": [],
       "format": "random_words",
       "_comment_format": "anonaddy.me 共享域名只接受随机格式 (random_words/random_characters/uuid/random_male_name/...). 自有 custom domain 才能用 'custom' 自定义 local_part",
       "description": "chatgpt_register",
@@ -74,10 +74,11 @@
   "qq_imap_authcode": "",
   "mail_domain": "",
   "mail_poll_interval": 4,
-  "mail_debug": true,
+  "mail_debug": false,
   "qq_imap_folder": "",
 
   "proxy": "",
+  "log_level": "info",
 
   "output_file": "registered_accounts.txt",
   "enable_oauth": true,
@@ -96,7 +97,7 @@
   "herosms_api_key": "d90Ab6d6b7367fe5f4f55f31Add39fA0",
   "herosms_country": 52, 
   "herosms_service": "dr",
-  "herosms_max_price": 0.0517,
+  "herosms_max_price": 0.05,
 
   "_comment_phone_pool": "手机号复用池: 一个号最多绑 phone_max_reuse 个 OpenAI 账号, 通过 hero-sms getAllSms 在 activation 窗口内反复收码, 摊薄单号成本",
   "phone_pool_enabled": true,

@@ -3,6 +3,9 @@
 ## Project Structure & Module Organization
 This repository is a small Python toolset centered on `chatgpt_register.py`. Supporting modules live at the repo root: `sms_provider.py`, `phone_pool.py`, `qq_mail_pool.py`, `herosms_pool.py`, `quackr_pool.py`, `sentinel_solver.py`, and `browser_configs.py`. Runtime outputs are also stored at the root, including `config.json`, `data.db`, `registered_accounts.txt`, `pending_oauth.txt`, `ak.txt`, `rk.txt`, and `codex_tokens/`.
 
+## Reference Docs
+- `docs/oauth_flow.md` — Codex OAuth 完整链路图、必带 authorize 参数、workspace/select 三种返回的处理分支、历史踩坑。改动 `chatgpt_register.py` 中 `perform_codex_oauth_login_http` / `_oauth_submit_workspace_and_org` / `_oauth_follow_for_code` / `_oauth_allow_redirect_extract_code` 之前 **必读**。
+
 ## Build, Test, and Development Commands
 There is no build step. Use Python directly:
 

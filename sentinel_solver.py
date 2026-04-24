@@ -15,6 +15,7 @@ import uuid
 from typing import Callable, Optional
 
 from patchright.async_api import async_playwright
+from log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
 
 try:
     from quart import Quart, jsonify, request
@@ -74,6 +75,31 @@ def _parse_proxy(proxy_url: str):
     return out
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _to_logging_level(level: str) -> int:
+    normalized = normalize_log_level(level)
+    if normalized == "debug":
+        return logging.DEBUG
+    if normalized in {"warn", "error"}:
+        return logging.WARNING if normalized == "warn" else logging.ERROR
+    return logging.INFO
+
+
+def _emit_callback(callback: Callable[..., None], message: str, *, level: str) -> None:
+    try:
+        callback(message, level=level)
+        return
+    except TypeError:
+        callback(message)
+
+
 COLORS = {
     "MAGENTA": "\033[35m", "BLUE": "\033[34m", "GREEN": "\033[32m",
     "YELLOW": "\033[33m", "RED": "\033[31m", "RESET": "\033[0m",
@@ -109,23 +135,60 @@ class _LogProxy:
 
 
 class _CallbackLogger:
-    def __init__(self, callback: Callable[[str], None]):
+    def __init__(self, callback: Callable[[str], None], min_level: str):
         self._callback = callback
+        self._min_level = normalize_log_level(min_level)
 
     def setLevel(self, level):
         return None
 
     def info(self, msg, *a, **kw):
-        self._callback(str(msg))
+        if should_log("info", self._min_level):
+            _emit_callback(self._callback, str(msg), level="info")
 
     def warning(self, msg, *a, **kw):
-        self._callback(str(msg))
+        if should_log("warn", self._min_level):
+            _emit_callback(self._callback, str(msg), level="warn")
 
     def error(self, msg, *a, **kw):
-        self._callback(str(msg))
+        if should_log("error", self._min_level):
+            _emit_callback(self._callback, str(msg), level="error")
 
     def debug(self, msg, *a, **kw):
-        self._callback(str(msg))
+        if should_log("debug", self._min_level):
+            _emit_callback(self._callback, str(msg), level="debug")
+
+
+def _load_runtime_config():
+    config = {
+        "thread": 2,
+        "headless": True,
+        "channel": "chromium",
+        "log_level": DEFAULT_LOG_LEVEL,
+    }
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                config["thread"] = int(payload.get("sentinel_solver_thread", config["thread"]) or config["thread"])
+                config["headless"] = _as_bool(payload.get("sentinel_solver_headless", config["headless"]))
+                config["channel"] = str(payload.get("sentinel_solver_channel", config["channel"]) or config["channel"])
+                config["log_level"] = normalize_log_level(
+                    payload.get("log_level", config["log_level"]),
+                    default=config["log_level"],
+                )
+        except Exception:
+            pass
+    config["thread"] = int(os.environ.get("SENTINEL_SOLVER_THREAD", config["thread"]) or config["thread"])
+    config["headless"] = _as_bool(os.environ.get("SENTINEL_SOLVER_HEADLESS", config["headless"]))
+    config["channel"] = str(os.environ.get("SENTINEL_SOLVER_CHANNEL", config["channel"]) or config["channel"])
+    config["log_level"] = normalize_log_level(
+        os.environ.get("SENTINEL_SOLVER_LOG_LEVEL", os.environ.get("LOG_LEVEL", config["log_level"])),
+        default=config["log_level"],
+    )
+    return config
 
 
 _base_logger = logging.getLogger("SentinelSolver")
@@ -141,12 +204,14 @@ logger = _LogProxy(_base_logger)
 class SentinelSolver:
     def __init__(self, headless: bool, thread: int, debug: bool, channel: str,
                  default_proxy: Optional[str] = None, enable_http: bool = True,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None,
+                 log_level: Optional[str] = None):
         global logger
         self.app = None
         self.headless = headless
         self.thread = thread
         self.debug = debug
+        self.log_level = normalize_log_level(log_level, default="debug" if debug else DEFAULT_LOG_LEVEL)
         self.channel = channel
         self.default_proxy = default_proxy
         self.browser_pool: asyncio.Queue = asyncio.Queue()
@@ -157,10 +222,10 @@ class SentinelSolver:
         self._start_lock = asyncio.Lock()
 
         if log is not None:
-            logger = _LogProxy(_CallbackLogger(log))
-
-        if self.debug:
-            logger.setLevel(logging.DEBUG)
+            logger = _LogProxy(_CallbackLogger(log, min_level=self.log_level))
+        else:
+            logger = _LogProxy(_base_logger)
+            logger.setLevel(_to_logging_level(self.log_level))
 
         if enable_http:
             self._setup_http_routes()
@@ -744,18 +809,24 @@ class SentinelSolver:
 
 
 def main():
+    runtime_cfg = _load_runtime_config()
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5732)
-    p.add_argument("--thread", type=int, default=2)
-    p.add_argument("--headless", dest="headless", action="store_true", default=True)
+    p.add_argument("--thread", type=int, default=runtime_cfg["thread"])
+    p.add_argument("--headless", dest="headless", action="store_true", default=runtime_cfg["headless"])
     p.add_argument("--no-headless", dest="headless", action="store_false")
-    p.add_argument("--channel", default="chromium",
+    p.add_argument("--channel", default=runtime_cfg["channel"],
                    help="patchright 浏览器 channel: chromium / chrome / msedge")
     p.add_argument("--proxy", default=None,
                    help="默认代理 URL（如 http://127.0.0.1:7890），请求 body 里的 proxy 字段优先")
+    p.add_argument("--log-level", choices=["debug", "info", "warn", "error"], default=None)
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
+    effective_log_level = normalize_log_level(
+        args.log_level,
+        default="debug" if args.debug else runtime_cfg["log_level"],
+    )
 
     default_proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
                     or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
@@ -766,6 +837,7 @@ def main():
         debug=args.debug,
         channel=args.channel,
         default_proxy=default_proxy,
+        log_level=effective_log_level,
     )
     if default_proxy:
         logger.info(f"使用默认代理: {default_proxy}")

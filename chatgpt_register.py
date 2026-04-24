@@ -27,6 +27,7 @@ import urllib.request
 from typing import Any
 
 from curl_cffi import requests as curl_requests
+from log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
 
 try:
     from sentinel_solver import SentinelSolver as EmbeddedSentinelSolver
@@ -88,11 +89,13 @@ _file_lock = threading.Lock()
 
 _ANSI_RESET = "\033[0m"
 _ANSI_LEVEL = {
+    "debug": "\033[2;37m",
     "info": "\033[37m",
     "success": "\033[1;32m",
     "warn": "\033[1;33m",
     "error": "\033[1;31m",
 }
+_CURRENT_LOG_LEVEL = DEFAULT_LOG_LEVEL
 
 
 def _stdout_supports_color() -> bool:
@@ -103,6 +106,8 @@ def _stdout_supports_color() -> bool:
 
 
 def _console_log(message: str, *, level: str = "info") -> None:
+    if not should_log(level, _CURRENT_LOG_LEVEL):
+        return
     text = str(message)
     if _stdout_supports_color():
         text = f"{_ANSI_LEVEL.get(level, _ANSI_LEVEL['info'])}{text}{_ANSI_RESET}"
@@ -134,6 +139,7 @@ def _load_config():
         "rk_file": "rk.txt",
         "max_workers": 3,
         "tui_enabled": True,
+        "log_level": DEFAULT_LOG_LEVEL,
         "token_json_dir": "codex_tokens",
         "upload_api_url": "",
         "upload_api_token": "",
@@ -153,8 +159,9 @@ def _load_config():
         # herosms 默认 (HeroSmsProvider 内部还会再读一次, 这里只为方便覆盖)
         "herosms_api_key": "",
         "herosms_country": 52,
-        "herosms_service": "oai",
+        "herosms_service": "dr",
         "herosms_max_price": 0.05,
+        "herosms_fixed_price": True,
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -169,6 +176,10 @@ def _load_config():
     # 环境变量优先级更高
     config["duckmail_api_base"] = os.environ.get("DUCKMAIL_API_BASE", config["duckmail_api_base"])
     config["duckmail_bearer"] = os.environ.get("DUCKMAIL_BEARER", config["duckmail_bearer"])
+    config["log_level"] = normalize_log_level(
+        os.environ.get("CHATGPT_REGISTER_LOG_LEVEL", os.environ.get("LOG_LEVEL", config["log_level"])),
+        default=config["log_level"],
+    )
     config["proxy"] = os.environ.get("PROXY", config["proxy"])
     config["total_accounts"] = int(os.environ.get("TOTAL_ACCOUNTS", config["total_accounts"]))
     config["enable_oauth"] = os.environ.get("ENABLE_OAUTH", config["enable_oauth"])
@@ -658,6 +669,7 @@ def _describe_email_source(source):
 def _build_imap_pool_config(profile, domain):
     if not profile or not domain:
         return None
+    log_level = "debug" if _as_bool(_CONFIG.get("mail_debug", False)) else _CURRENT_LOG_LEVEL
     return {
         "mail_imap_host": profile["host"],
         "mail_imap_port": profile["port"],
@@ -668,6 +680,7 @@ def _build_imap_pool_config(profile, domain):
         "mail_domain": domain,
         "mail_poll_interval": _CONFIG.get("mail_poll_interval", 4),
         "mail_debug": bool(_CONFIG.get("mail_debug", False)),
+        "log_level": log_level,
     }
 
 
@@ -679,7 +692,7 @@ def _get_mail_pool_for_provider(mail_provider):
     domain = _get_source_mail_domain(source)
     if not source or not profile or not domain:
         return None
-    log = monitor.channel("email") if monitor is not None else None
+    log = _make_channel_logger("email")
     imap_cfg = _build_imap_pool_config(profile, domain)
     if source["type"] == "addy":
         if not _get_addy_pool:
@@ -699,6 +712,7 @@ def _get_mail_pool_for_provider(mail_provider):
 
 
 _CONFIG = _load_config()
+_CURRENT_LOG_LEVEL = normalize_log_level(_CONFIG.get("log_level", DEFAULT_LOG_LEVEL))
 DUCKMAIL_API_BASE = _CONFIG["duckmail_api_base"]
 DUCKMAIL_BEARER = _CONFIG["duckmail_bearer"]
 DEFAULT_TOTAL_ACCOUNTS = _CONFIG["total_accounts"]
@@ -714,6 +728,7 @@ RK_FILE = _CONFIG["rk_file"]
 DEFAULT_MAX_WORKERS = _CONFIG["max_workers"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
 TUI_ENABLED = _as_bool(_CONFIG.get("tui_enabled", True))
+LOG_LEVEL = _CURRENT_LOG_LEVEL
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
 SENTINEL_SOLVER_URL = _CONFIG["sentinel_solver_url"]
@@ -765,10 +780,25 @@ _inflight_workers: set[str] = set()
 
 
 def _monitor_emit(channel_name, message, *, level="info", worker_id=None, **fields):
+    if not should_log(level, _CURRENT_LOG_LEVEL):
+        return
     if monitor is not None:
         monitor.emit(channel_name, message, level=level, worker_id=worker_id, **fields)
         return
     _console_log(f"[{channel_name}] {message}", level=level)
+
+
+def _make_channel_logger(channel_name, *, default_level="info", **bound_fields):
+    def _log(message, *, level=default_level):
+        _monitor_emit(channel_name, message, level=level, **bound_fields)
+
+    return _log
+
+
+def _set_log_level(level):
+    global _CURRENT_LOG_LEVEL, LOG_LEVEL
+    _CURRENT_LOG_LEVEL = normalize_log_level(level, default=_CURRENT_LOG_LEVEL)
+    LOG_LEVEL = _CURRENT_LOG_LEVEL
 
 
 def _worker_log(message, *, level="info", **fields):
@@ -1001,7 +1031,8 @@ class _InProcessSentinelRuntime:
                 channel=self.channel,
                 default_proxy=self.default_proxy,
                 enable_http=False,
-                log=monitor.channel("sentinel") if monitor is not None else None,
+                log=_make_channel_logger("sentinel"),
+                log_level="debug" if self.debug else _CURRENT_LOG_LEVEL,
             )
             loop.run_until_complete(self._solver.ensure_started())
         except Exception as e:
@@ -1730,6 +1761,47 @@ class ChatGPTRegister:
             account=_mask_email(getattr(self, "email", "")),
         )
 
+    def _is_retryable_oauth_exception(self, exc) -> bool:
+        msg = str(exc).lower()
+        retry_markers = (
+            "recv failure",
+            "connection reset",
+            "reset by peer",
+            "connection aborted",
+            "connection refused",
+            "connection closed",
+            "timed out",
+            "timeout",
+            "network is unreachable",
+            "temporarily unavailable",
+            "temporary failure",
+            "proxy connect",
+        )
+        return any(marker in msg for marker in retry_markers)
+
+    def _oauth_request_with_backoff(self, method: str, url: str, *, step_label: str,
+                                    retries: int = 2, base_delay: float = 1.0, **kwargs):
+        request_fn = getattr(self.session, method.lower())
+        last_exc = None
+
+        for attempt in range(retries + 1):
+            try:
+                return request_fn(url, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                retry_index = attempt + 1
+                if retry_index > retries or not self._is_retryable_oauth_exception(exc):
+                    raise
+
+                delay = base_delay * (2 ** attempt)
+                self._print(
+                    f"[OAuth] {step_label} 网络异常，{delay:.1f}s 后进行第 "
+                    f"{retry_index}/{retries} 次重试: {exc}"
+                )
+                time.sleep(delay)
+
+        raise last_exc
+
     # ==================== DuckMail 临时邮箱 ====================
 
     def create_temp_email(self):
@@ -2219,6 +2291,10 @@ class ChatGPTRegister:
                 lease = pool.acquire_or_reuse()
             except NoNumberAvailable as e:
                 self._print(f"[Phone] {e}")
+                last_err = e
+                if attempt < SMS_MAX_RETRIES:
+                    time.sleep(2)
+                    continue
                 return None, None
             except PhonePoolCapacityExhausted as e:
                 _bump_metric("cap_skipped")
@@ -2329,6 +2405,10 @@ class ChatGPTRegister:
                 sess = provider.acquire()
             except NoNumberAvailable as e:
                 self._print(f"[Phone] {e}")
+                last_err = e
+                if attempt < SMS_MAX_RETRIES:
+                    time.sleep(2)
+                    continue
                 return None, None
             except (AcquireFailed, SmsProviderError) as e:
                 self._print(f"[Phone] acquire 异常: {e}")
@@ -2454,8 +2534,10 @@ class ChatGPTRegister:
             headers["Referer"] = referer
 
         try:
-            resp = self.session.get(
+            resp = self._oauth_request_with_backoff(
+                "get",
                 url,
+                step_label="allow_redirect",
                 headers=headers,
                 allow_redirects=True,
                 timeout=30,
@@ -2502,8 +2584,10 @@ class ChatGPTRegister:
 
         for hop in range(max_hops):
             try:
-                resp = self.session.get(
+                resp = self._oauth_request_with_backoff(
+                    "get",
                     current_url,
+                    step_label=f"follow[{hop + 1}]",
                     headers=headers,
                     allow_redirects=False,
                     timeout=30,
@@ -2531,9 +2615,19 @@ class ChatGPTRegister:
                     return None, last_url
                 if loc.startswith("/"):
                     loc = f"{OAUTH_ISSUER}{loc}"
+                self._print(f"[OAuth] follow[{hop + 1}] -> Location={loc[:160]}")
                 code = _extract_code_from_url(loc)
+                if not code:
+                    # localhost callback URL 兜底: query 解析失败时用 regex 直接抓 code=
+                    m = re.search(r"[?&]code=([^&\s'\"]+)", loc)
+                    if m:
+                        code = m.group(1)
                 if code:
                     return code, loc
+                # 如果 Location 指向 localhost 但没抓到 code, 不要再去 GET (会被代理超时 30s)
+                if loc.startswith("http://localhost") or loc.startswith("https://localhost"):
+                    self._print(f"[OAuth] follow[{hop + 1}] Location 是 localhost 但无 code, 终止")
+                    return None, loc
                 current_url = loc
                 headers["Referer"] = last_url
                 continue
@@ -2547,8 +2641,10 @@ class ChatGPTRegister:
         # (含本次 add_phone/account_create 之后真实的 workspaces) 落到本地 jar 里,
         # 否则可能拿到 add_phone 之前的陈旧 session, workspace_id 已失效 → 400
         try:
-            self.session.get(
+            self._oauth_request_with_backoff(
+                "get",
                 consent_url,
+                step_label="预 GET consent",
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Referer": f"{OAUTH_ISSUER}/log-in/password",
@@ -2593,8 +2689,33 @@ class ChatGPTRegister:
         }
         h.update(_make_trace_headers())
 
-        resp = self.session.post(
+        def _is_duplicate_error(text: str) -> bool:
+            t = (text or "").lower()
+            return ('"code": "duplicate"' in t
+                    or '"code":"duplicate"' in t
+                    or "already has a default project" in t
+                    or "already has" in t and "project" in t)
+
+        def _advance_via_authorize(referer: str):
+            # workspace/org 选择已在服务端推进 (200 / 3xx / duplicate),
+            # 重新 GET authorize_url, 让服务端经 consent → consent_verifier
+            # → http://localhost:1455/auth/callback?code=... 自己跳完
+            authorize_url = getattr(self, "_current_authorize_url", None)
+            if authorize_url:
+                code = self._oauth_allow_redirect_extract_code(authorize_url, referer=referer)
+                if code:
+                    self._print("[OAuth] advance: authorize_url 命中 callback code")
+                    return code
+                code, _ = self._oauth_follow_for_code(authorize_url, referer=referer)
+                if code:
+                    self._print("[OAuth] advance: authorize_url follow 命中 code")
+                    return code
+            return None
+
+        resp = self._oauth_request_with_backoff(
+            "post",
             f"{OAUTH_ISSUER}/api/accounts/workspace/select",
+            step_label="POST /api/accounts/workspace/select",
             json={"workspace_id": workspace_id},
             headers=h,
             allow_redirects=False,
@@ -2602,6 +2723,10 @@ class ChatGPTRegister:
             impersonate=self.impersonate,
         )
         self._print(f"[OAuth] workspace/select -> {resp.status_code}")
+
+        ws_data = {}
+        ws_next = ""
+        ws_page = ""
 
         if resp.status_code in (301, 302, 303, 307, 308):
             loc = resp.headers.get("Location", "")
@@ -2613,7 +2738,14 @@ class ChatGPTRegister:
             code, _ = self._oauth_follow_for_code(loc, referer=consent_url)
             if not code:
                 code = self._oauth_allow_redirect_extract_code(loc, referer=consent_url)
-            return code
+            if code:
+                return code
+            # 3xx 跟完没 code, 进 advance 兜底
+            return _advance_via_authorize(consent_url)
+
+        if resp.status_code == 400 and _is_duplicate_error(resp.text):
+            self._print("[OAuth] workspace/select 已幂等完成 (duplicate), 走 authorize 推进")
+            return _advance_via_authorize(consent_url)
 
         if resp.status_code != 200:
             self._print(f"[OAuth] workspace/select 失败: {resp.status_code} {resp.text[:240]}")
@@ -2622,8 +2754,8 @@ class ChatGPTRegister:
         try:
             ws_data = resp.json()
         except Exception:
-            self._print("[OAuth] workspace/select 响应不是 JSON")
-            return None
+            self._print("[OAuth] workspace/select 响应不是 JSON, 走 authorize 推进")
+            return _advance_via_authorize(consent_url)
 
         ws_next = ws_data.get("continue_url", "")
         orgs = ws_data.get("data", {}).get("orgs", []) or ws_data.get("orgs", []) or []
@@ -2632,25 +2764,22 @@ class ChatGPTRegister:
         self._print(f"[OAuth] workspace/select keys={list(ws_data.keys())} "
                     f"data_keys={list((ws_data.get('data') or {}).keys())} orgs_len={len(orgs)}")
 
-        org_id = None
-        project_id = None
-        if orgs:
-            org_id = (orgs[0] or {}).get("id")
-            projects = (orgs[0] or {}).get("projects", [])
-            if projects:
-                project_id = (projects[0] or {}).get("id")
-        else:
-            # 退路: 从 oai-client-auth-session cookie 解析 orgs (workspace/select 后服务端会刷新)
-            sess2 = self._decode_oauth_session_cookie() or {}
-            sess_orgs = (sess2.get("orgs") or [])
-            if sess_orgs:
-                org_id = (sess_orgs[0] or {}).get("id")
-                projs = (sess_orgs[0] or {}).get("projects", []) or []
-                if projs:
-                    project_id = (projs[0] or {}).get("id")
-                self._print(f"[OAuth] orgs 从 session cookie 兜底, org_id={org_id} project_id={project_id}")
+        # 仅在服务端真的把页面推到 org 选择态、且确实有多个 org 需要选时, 才发 organization/select
+        # 单 org + 默认 project 的新号: 服务端早已 auto-select, 再发只会得到 duplicate, 直接走 advance
+        need_org_select = (
+            ws_page == "sign_in_with_chatgpt_codex_org"
+            and len(orgs) > 1
+        )
 
-        if org_id:
+        if need_org_select:
+            org_id = (orgs[0] or {}).get("id")
+            projects = (orgs[0] or {}).get("projects", []) or []
+            project_id = (projects[0] or {}).get("id") if projects else None
+
+            if not org_id:
+                self._print("[OAuth] org_id 为空, 跳过 organization/select, 直接 advance")
+                return _advance_via_authorize(consent_url) or self._fallback_follow_ws_next(ws_next, consent_url)
+
             org_body = {"org_id": org_id}
             if project_id:
                 org_body["project_id"] = project_id
@@ -2659,8 +2788,10 @@ class ChatGPTRegister:
             if ws_next:
                 h_org["Referer"] = ws_next if ws_next.startswith("http") else f"{OAUTH_ISSUER}{ws_next}"
 
-            resp_org = self.session.post(
+            resp_org = self._oauth_request_with_backoff(
+                "post",
                 f"{OAUTH_ISSUER}/api/accounts/organization/select",
+                step_label="POST /api/accounts/organization/select",
                 json=org_body,
                 headers=h_org,
                 allow_redirects=False,
@@ -2668,28 +2799,7 @@ class ChatGPTRegister:
                 impersonate=self.impersonate,
             )
             self._print(f"[OAuth] organization/select -> {resp_org.status_code}")
-            if resp_org.status_code >= 400:
-                self._print(f"[OAuth] organization/select 错误: body={resp_org.text[:300]} "
-                            f"req_body={org_body}")
-                if (
-                    resp_org.status_code == 400
-                    and project_id
-                    and "duplicate" in resp_org.text.lower()
-                ):
-                    org_body = {"org_id": org_id}
-                    self._print("[OAuth] organization/select duplicate, 去掉 project_id 重试")
-                    resp_org = self.session.post(
-                        f"{OAUTH_ISSUER}/api/accounts/organization/select",
-                        json=org_body,
-                        headers=h_org,
-                        allow_redirects=False,
-                        timeout=30,
-                        impersonate=self.impersonate,
-                    )
-                    self._print(f"[OAuth] organization/select(retry) -> {resp_org.status_code}")
-                    if resp_org.status_code >= 400:
-                        self._print(f"[OAuth] organization/select(retry) 错误: "
-                                    f"body={resp_org.text[:300]} req_body={org_body}")
+
             if resp_org.status_code in (301, 302, 303, 307, 308):
                 loc = resp_org.headers.get("Location", "")
                 if loc.startswith("/"):
@@ -2700,35 +2810,57 @@ class ChatGPTRegister:
                 code, _ = self._oauth_follow_for_code(loc, referer=h_org.get("Referer"))
                 if not code:
                     code = self._oauth_allow_redirect_extract_code(loc, referer=h_org.get("Referer"))
-                return code
-
-            if resp_org.status_code == 200:
-                try:
-                    org_data = resp_org.json()
-                except Exception:
-                    self._print("[OAuth] organization/select 响应不是 JSON")
-                    return None
-
-                org_next = org_data.get("continue_url", "")
-                org_page = (org_data.get("page") or {}).get("type", "")
-                self._print(f"[OAuth] organization/select page={org_page or '-'} next={(org_next or '-')[:140]}")
-                if org_next:
-                    if org_next.startswith("/"):
-                        org_next = f"{OAUTH_ISSUER}{org_next}"
-                    code, _ = self._oauth_follow_for_code(org_next, referer=h_org.get("Referer"))
-                    if not code:
-                        code = self._oauth_allow_redirect_extract_code(org_next, referer=h_org.get("Referer"))
+                if code:
                     return code
 
-        if ws_next:
-            if ws_next.startswith("/"):
-                ws_next = f"{OAUTH_ISSUER}{ws_next}"
-            code, _ = self._oauth_follow_for_code(ws_next, referer=consent_url)
-            if not code:
-                code = self._oauth_allow_redirect_extract_code(ws_next, referer=consent_url)
+            elif resp_org.status_code == 400 and _is_duplicate_error(resp_org.text):
+                self._print("[OAuth] organization/select 已幂等完成 (duplicate), 走 authorize 推进")
+
+            elif resp_org.status_code == 200:
+                self._print("[OAuth] organization/select 200, 走 authorize 推进")
+
+            else:
+                self._print(f"[OAuth] organization/select 非预期: {resp_org.status_code} "
+                            f"body={resp_org.text[:240]}")
+
+        # 优先级 1: ws_next 已经是带 login_verifier 的 oauth2/auth (page=external_url),
+        # 这是服务端给的规范链路, 直接 follow 就能拿到 code (HAR 验证过)
+        # 必须先于 advance, 因为 advance 带 prompt=login 会强制重登录, 把 cookie state 搞坏
+        ws_next_full = ws_next
+        if ws_next_full.startswith("/"):
+            ws_next_full = f"{OAUTH_ISSUER}{ws_next_full}"
+
+        if ws_next_full and (
+            ws_page == "external_url"
+            or "/api/oauth/oauth2/auth" in ws_next_full
+            or "login_verifier=" in ws_next_full
+            or "consent_verifier=" in ws_next_full
+        ):
+            self._print(f"[OAuth] ws_next 是规范 oauth 链路, 优先 follow: {ws_next_full[:160]}")
+            code, _ = self._oauth_follow_for_code(ws_next_full, referer=consent_url)
+            if code:
+                return code
+            code = self._oauth_allow_redirect_extract_code(ws_next_full, referer=consent_url)
+            if code:
+                return code
+
+        # 优先级 2: 兜底用 advance 重新 GET authorize_url
+        code = _advance_via_authorize(consent_url)
+        if code:
             return code
 
-        return None
+        # 优先级 3: 老路径 follow ws_next (即使不像规范链路, 也再试一次)
+        return self._fallback_follow_ws_next(ws_next, consent_url)
+
+    def _fallback_follow_ws_next(self, ws_next: str, consent_url: str):
+        if not ws_next:
+            return None
+        if ws_next.startswith("/"):
+            ws_next = f"{OAUTH_ISSUER}{ws_next}"
+        code, _ = self._oauth_follow_for_code(ws_next, referer=consent_url)
+        if not code:
+            code = self._oauth_allow_redirect_extract_code(ws_next, referer=consent_url)
+        return code
 
     def perform_codex_oauth_login_http(self, email: str, password: str, mail_token: str = None):
         self._print("[OAuth] 开始执行 Codex OAuth 纯协议流程...")
@@ -2744,12 +2876,19 @@ class ChatGPTRegister:
             "response_type": "code",
             "client_id": OAUTH_CLIENT_ID,
             "redirect_uri": OAUTH_REDIRECT_URI,
-            "scope": "openid profile email offline_access",
+            "scope": "openid email profile offline_access",
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "state": state,
+            # codex CLI 简化流: 服务端会自动处理 workspace/org/project, 直接 302 出 consent_verifier
+            # 不带这三个 flag 时 workspace/select 之后会被强制进入 codex_org 页面,
+            # 而 organization/select 又会因 add_phone 已建过默认 project 而返回 duplicate
+            "codex_cli_simplified_flow": "true",
+            "id_token_add_organizations": "true",
+            "prompt": "login",
         }
         authorize_url = f"{OAUTH_ISSUER}/oauth/authorize?{urlencode(authorize_params)}"
+        self._current_authorize_url = authorize_url
 
         def _oauth_json_headers(referer: str):
             h = {
@@ -2766,8 +2905,10 @@ class ChatGPTRegister:
         def _bootstrap_oauth_session():
             self._print("[OAuth] 1/7 GET /oauth/authorize")
             try:
-                r = self.session.get(
+                r = self._oauth_request_with_backoff(
+                    "get",
                     authorize_url,
+                    step_label="GET /oauth/authorize",
                     headers={
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                         "Referer": f"{self.BASE}/",
@@ -2793,8 +2934,10 @@ class ChatGPTRegister:
                 self._print("[OAuth] 未拿到 login_session，尝试访问 oauth2 auth 入口")
                 oauth2_url = f"{OAUTH_ISSUER}/api/oauth/oauth2/auth"
                 try:
-                    r2 = self.session.get(
+                    r2 = self._oauth_request_with_backoff(
+                        "get",
                         oauth2_url,
+                        step_label="GET /api/oauth/oauth2/auth",
                         headers={
                             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                             "Referer": authorize_url,
@@ -2829,8 +2972,10 @@ class ChatGPTRegister:
             headers_continue["openai-sentinel-token"] = sentinel_authorize
 
             try:
-                return self.session.post(
+                return self._oauth_request_with_backoff(
+                    "post",
                     f"{OAUTH_ISSUER}/api/accounts/authorize/continue",
+                    step_label="POST /api/accounts/authorize/continue",
                     json={"username": {"kind": "email", "value": email}},
                     headers=headers_continue,
                     timeout=30,
@@ -2890,8 +3035,10 @@ class ChatGPTRegister:
         headers_verify["openai-sentinel-token"] = sentinel_pwd
 
         try:
-            resp_verify = self.session.post(
+            resp_verify = self._oauth_request_with_backoff(
+                "post",
                 f"{OAUTH_ISSUER}/api/accounts/password/verify",
+                step_label="POST /api/accounts/password/verify",
                 json={"password": password},
                 headers=headers_verify,
                 timeout=30,
@@ -2944,8 +3091,10 @@ class ChatGPTRegister:
 
             headers_mfa = _oauth_json_headers(f"{OAUTH_ISSUER}/mfa-challenge")
             try:
-                resp_issue = self.session.post(
+                resp_issue = self._oauth_request_with_backoff(
+                    "post",
                     f"{OAUTH_ISSUER}/api/accounts/mfa/issue_challenge",
+                    step_label="POST /api/accounts/mfa/issue_challenge",
                     json={"id": factor_id, "type": "email", "force_fresh_challenge": False},
                     headers=headers_mfa,
                     timeout=30,
@@ -2972,8 +3121,10 @@ class ChatGPTRegister:
 
             def _submit_mfa_code(code_):
                 try:
-                    r_ = self.session.post(
+                    r_ = self._oauth_request_with_backoff(
+                        "post",
                         f"{OAUTH_ISSUER}/api/accounts/mfa/verify",
+                        step_label="POST /api/accounts/mfa/verify",
                         json={"id": factor_id, "type": "email", "code": code_},
                         headers=headers_verify_mfa,
                         timeout=30,
@@ -3127,8 +3278,10 @@ class ChatGPTRegister:
                         tried_codes.add(otp_code)
                         self._print(f"[OAuth] (IMAP) 尝试 OTP: {otp_code}")
                         try:
-                            resp_otp = self.session.post(
+                            resp_otp = self._oauth_request_with_backoff(
+                                "post",
                                 f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
+                                step_label="POST /api/accounts/email-otp/validate",
                                 json={"code": otp_code},
                                 headers=headers_otp,
                                 timeout=30,
@@ -3170,8 +3323,10 @@ class ChatGPTRegister:
                         continue
                     tried_codes.add(manual_code)
                     try:
-                        resp_otp = self.session.post(
+                        resp_otp = self._oauth_request_with_backoff(
+                            "post",
                             f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
+                            step_label="POST /api/accounts/email-otp/validate",
                             json={"code": manual_code},
                             headers=headers_otp,
                             timeout=30,
@@ -3225,8 +3380,10 @@ class ChatGPTRegister:
                     tried_codes.add(otp_code)
                     self._print(f"[OAuth] 尝试 OTP: {otp_code}")
                     try:
-                        resp_otp = self.session.post(
+                        resp_otp = self._oauth_request_with_backoff(
+                            "post",
                             f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
+                            step_label="POST /api/accounts/email-otp/validate",
                             json={"code": otp_code},
                             headers=headers_otp,
                             timeout=30,
@@ -3327,8 +3484,10 @@ class ChatGPTRegister:
             return None
 
         self._print("[OAuth] 7/7 POST /oauth/token")
-        token_resp = self.session.post(
+        token_resp = self._oauth_request_with_backoff(
+            "post",
             f"{OAUTH_ISSUER}/oauth/token",
+            step_label="POST /oauth/token",
             headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": self.ua},
             data={
                 "grant_type": "authorization_code",
@@ -4008,6 +4167,7 @@ def _parse_main_args(argv):
         "proxy": None,
         "count": None,
         "workers": None,
+        "log_level": None,
         "force_tui": False,
         "force_no_tui": False,
     }
@@ -4039,6 +4199,14 @@ def _parse_main_args(argv):
             except ValueError:
                 pass
             i += 2
+            continue
+        if token == "--log-level" and i + 1 < len(argv):
+            args["log_level"] = normalize_log_level(argv[i + 1], default=_CURRENT_LOG_LEVEL)
+            i += 2
+            continue
+        if token == "--debug":
+            args["log_level"] = "debug"
+            i += 1
             continue
         if token == "--tui":
             args["force_tui"] = True
@@ -4144,6 +4312,8 @@ def main():
     global _force_no_tui, _force_tui
     try:
         main_args = _parse_main_args(sys.argv[1:])
+        if main_args["log_level"] is not None:
+            _set_log_level(main_args["log_level"])
         if main_args["force_no_tui"]:
             _force_no_tui = True
             os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"

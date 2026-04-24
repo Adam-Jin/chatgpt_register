@@ -88,6 +88,46 @@ class QQMailPoolAddressTests(unittest.TestCase):
         self.assertEqual(fake_stop.wait_calls, [pool.poll_interval])
         fake_imap.logout.assert_called_once()
 
+    def test_debug_logs_are_suppressed_below_threshold(self):
+        messages = []
+        pool = QQMailPool(
+            host="imap.example.com",
+            port=993,
+            user="root@example.com",
+            authcode="secret",
+            domain="example.com",
+            poll_interval=1,
+            debug=False,
+            log=messages.append,
+            log_level="info",
+        )
+
+        pool._log("hidden")
+
+        self.assertEqual(messages, [])
+
+    def test_debug_logs_emit_with_level_aware_callback(self):
+        messages = []
+
+        def capture(message, *, level="info"):
+            messages.append((level, message))
+
+        pool = QQMailPool(
+            host="imap.example.com",
+            port=993,
+            user="root@example.com",
+            authcode="secret",
+            domain="example.com",
+            poll_interval=1,
+            debug=False,
+            log=capture,
+            log_level="debug",
+        )
+
+        pool._log("visible")
+
+        self.assertEqual(messages, [("debug", "[QQMailPool] visible")])
+
 
 if __name__ == "__main__":
     unittest.main()
