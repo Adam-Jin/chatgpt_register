@@ -5,16 +5,77 @@
 
   "duckmail_api_base": "https://api.duckmail.sbs",
   "duckmail_bearer": "pZM65bD5wxhHkiL",
+  "default_email_source": "pandalabs",
 
-  "_comment_qq_catchall": "自有域名 + Cloudflare Email Routing → QQ 邮箱 catch-all 收信",
-  "qq_imap_host": "imap.qq.com",
+  "_comment_imap_profiles": "纯收件箱配置: 只描述 IMAP 怎么连，不描述注册时用哪个域名/地址",
+  "imap_profiles": [
+    {
+      "key": "mail2925",
+      "name": "2925 Inbox",
+      "host": "imap.2925.com",
+      "port": 993,
+      "security": "ssl",
+      "user": "fyounvdia@2925.com",
+      "password": "aeaj6A2apJG3juk",
+      "folder": "INBOX"
+    },
+    {
+      "key": "qq-main",
+      "name": "Primary Inbox",
+      "host": "imap.qq.com",
+      "port": 993,
+      "user": "1033052348@qq.com",
+      "password": "tybtejqhqwgybejb",
+      "folder": "INBOX"
+    }
+  ],
+  "_comment_email_sources": "注册来源配置: 决定注册用哪个邮箱地址, 以及验证码默认走哪个收件箱",
+  "email_sources": [
+    {
+      "key": "pandalabs",
+      "name": "pandalabs.asia",
+      "type": "forward_domain",
+      "domain": "pandalabs.asia",
+      "receiver": "qq-main"
+    },
+    {
+      "key": "mail2925",
+      "name": "2925",
+      "type": "imap_mailbox",
+      "receiver": "mail2925",
+      "address_mode": "suffix_alias",
+      "enabled": true
+    },
+    {
+      "_comment": "addy.io 别名: 调 API 创建 *@<domain> 别名, addy 转发到 receiver 指向的 IMAP 邮箱",
+      "key": "addy103311",
+      "name": "addy.io 1033052348@qq.com",
+      "type": "addy",
+      "domain": "anonaddy.me",
+      "api_key": "addy_io_69YFQG7Kz2AtMGrPD3L2k4pbKZBgB30sMBN9pSdR2c04c4d6",
+      "receiver": "qq-main",
+      "recipient_ids": ["ead0c453-0899-490f-a362-b7a2f4b8cd37"],
+      "format": "random_words",
+      "_comment_format": "anonaddy.me 共享域名只接受随机格式 (random_words/random_characters/uuid/random_male_name/...). 自有 custom domain 才能用 'custom' 自定义 local_part",
+      "description": "chatgpt_register",
+      "delete_on_release": false,
+      "deactivate_on_release": false,
+      "enabled": true
+    }
+  ],
+  "mail_imap_host": "",
+  "mail_imap_port": 993,
+  "mail_imap_user": "",
+  "mail_imap_password": "",
+  "mail_imap_folder": "",
+  "qq_imap_host": "",
   "qq_imap_port": 993,
-  "qq_imap_user": "1033052348@qq.com",
-  "qq_imap_authcode": "tybtejqhqwgybejb",
-  "mail_domain": "pandalabs.asia",
+  "qq_imap_user": "",
+  "qq_imap_authcode": "",
+  "mail_domain": "",
   "mail_poll_interval": 4,
   "mail_debug": true,
-  "qq_imap_folder": "其他文件夹/ChatGPT-验证码",
+  "qq_imap_folder": "",
 
   "proxy": "",
 
@@ -33,9 +94,9 @@
   "sentinel_solver_url": "http://127.0.0.1:5732",
 
   "herosms_api_key": "d90Ab6d6b7367fe5f4f55f31Add39fA0",
-  "herosms_country": 52,
+  "herosms_country": 52, 
   "herosms_service": "dr",
-  "herosms_max_price": 0.0589,
+  "herosms_max_price": 0.0517,
 
   "_comment_phone_pool": "手机号复用池: 一个号最多绑 phone_max_reuse 个 OpenAI 账号, 通过 hero-sms getAllSms 在 activation 窗口内反复收码, 摊薄单号成本",
   "phone_pool_enabled": true,

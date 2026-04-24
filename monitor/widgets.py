@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import time
-from collections import deque
 from typing import Iterable, Optional
 
 from rich.table import Table
+from rich.text import Text
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -23,83 +23,96 @@ class StatusBar(Static):
     run_state = reactive("running")
     status_hint = reactive("")
 
-    def render(self) -> str:
-        paused = " | paused" if self.paused else ""
-        hint = f" | {self.status_hint}" if self.status_hint else ""
-        return (
-            f"state {self.run_state} | "
-            f"workers {self.active_workers}/{self.max_workers} | "
+    pool_fresh = reactive(0)
+    pool_reuse = reactive(0)
+    pool_active = reactive(0)
+    pool_max_active = reactive(0)
+    pool_waiters = reactive(0)
+    pool_spent = reactive(0.0)
+
+    viewing_worker = reactive("")
+    viewing_state = reactive("")
+    viewing_step = reactive("")
+    viewing_elapsed = reactive(0)
+
+    def render(self) -> Text:
+        line1 = Text()
+        line1.append(
+            f"{self.run_state} | W {self.active_workers}/{self.max_workers} | "
             f"done {self.done} | ok {self.success} | fail {self.fail} | "
-            f"warn_evt {self.warn} | rate {self.rate:.2f}/min | "
-            f"uptime {int(self.uptime_seconds)}s | dropped {self.dropped}{paused}{hint}"
+            f"rate {self.rate:.2f}/min",
+            style="white",
         )
+        if self.paused:
+            line1.append(" | paused", style="bold yellow")
+        if self.dropped:
+            line1.append(f" | dropped {self.dropped}", style="bold yellow")
+        if self.status_hint:
+            line1.append(f" | {self.status_hint}", style="dim")
+
+        line2 = Text()
+        if self.viewing_worker:
+            line2.append(
+                f"viewing {self.viewing_worker} | {self.viewing_state or '-'} | "
+                f"{self.viewing_step or '-'} | {int(self.viewing_elapsed)}s",
+                style="cyan",
+            )
+        else:
+            total_uses = int(self.pool_fresh) + int(self.pool_reuse)
+            line2.append(
+                f"pool: fresh {self.pool_fresh} | reuse {self.pool_reuse} | "
+                f"uses {total_uses} | active {self.pool_active}/{self.pool_max_active} | "
+                f"wait {self.pool_waiters} | ${self.pool_spent:.2f}",
+                style="cyan",
+            )
+        line1.append("\n")
+        line1.append_text(line2)
+        return line1
 
 
-class WorkerPanel(Static):
-    def __init__(self, worker_id: str, **kwargs):
+class WorkerListPanel(Static):
+    can_focus = True
+
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.worker_id = worker_id
-        self.account: str = "-"
-        self.step: str = "-"
-        self.started_at: Optional[float] = None
-        self.finished_at: Optional[float] = None
-        self.state: str = "idle"
-        self.recent_logs: deque[str] = deque(maxlen=8)
+        self.rows: list[dict] = []
+        self.selected_worker_id: Optional[str] = None
 
-    def set_account(self, account: Optional[str]) -> None:
-        if self.state != "active":
-            self.started_at = time.time()
-            self.finished_at = None
-        self.account = account or "-"
-        self.state = "active"
+    def update_workers(self, rows: list[dict], selected_worker_id: Optional[str]) -> None:
+        self.rows = rows
+        self.selected_worker_id = selected_worker_id
         self.refresh()
 
-    def set_step(self, step: Optional[str]) -> None:
-        if self.state != "active":
-            self.started_at = time.time()
-            self.finished_at = None
-        self.step = step or "-"
-        self.state = "active"
-        self.refresh()
-
-    def add_log(self, line: str) -> None:
-        self.recent_logs.append(line)
-        self.refresh()
-
-    def mark_idle(self) -> None:
-        if self.state == "active":
-            self.finished_at = time.time()
-        self.state = "idle"
-        if self.step == "-":
-            self.step = "done"
-        self.refresh()
-
-    def clear(self) -> None:
-        self.account = "-"
-        self.step = "-"
-        self.started_at = None
-        self.finished_at = None
-        self.state = "idle"
-        self.recent_logs.clear()
-        self.refresh()
-
-    def render(self) -> str:
-        elapsed = 0
-        if self.started_at is not None:
-            end_ts = self.finished_at if self.finished_at is not None else time.time()
-            elapsed = int(end_ts - self.started_at)
-        body = "\n".join(self.recent_logs) if self.recent_logs else "-"
-        return (
-            f"{self.worker_id}\n"
-            f"state: {self.state}\n"
-            f"acct: {self.account}\n"
-            f"step: {self.step}\n"
-            f"elapsed: {elapsed}s\n"
-            f"{body}"
-        )
+    def render(self) -> Text:
+        text = Text()
+        text.append("Workers\n", style="bold")
+        text.append("\n")
+        if not self.rows:
+            text.append("  -\n", style="dim")
+            return text
+        for row in self.rows:
+            marker = "> " if row.get("worker_id") == self.selected_worker_id else "  "
+            style = "reverse" if row.get("worker_id") == self.selected_worker_id else "white"
+            elapsed = int(row.get("elapsed", 0) or 0)
+            line = (
+                f"{marker}{row.get('worker_id', '?'):<3} "
+                f"{row.get('state', '-'):<6} "
+                f"{_shorten(row.get('step', '-') or '-', 14):<14} "
+                f"{elapsed:>3}s"
+            )
+            text.append(f"{line}\n", style=style)
+            account = row.get("account") or "-"
+            text.append(f"    {_shorten(account, 26)}\n", style="dim")
+        text.append("\n")
+        text.append("↑/↓ select\n", style="dim")
+        text.append("Enter inspect\n", style="dim")
+        text.append("Esc back", style="dim")
+        return text
 
 
 class PoolStatsPanel(Static):
+    can_focus = True
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.snapshot: dict = {}
@@ -109,17 +122,29 @@ class PoolStatsPanel(Static):
         self.refresh()
 
     def render(self):
-        table = Table.grid(padding=(0, 1))
         stats = self.snapshot or {}
-        table.add_row("active", f"{stats.get('active', 0)}/{stats.get('max_active', 0)}")
+        table = Table.grid(padding=(0, 1))
+        table.add_row("[b]Pool Stats[/b]", "")
+        table.add_row("", "")
+        table.add_row("[b]Config[/b]", "")
+        table.add_row("max_reuse", str(stats.get("max_reuse", 0)))
+        table.add_row("max_active", str(stats.get("max_active", 0)))
+        table.add_row("lease_sec", str(stats.get("lease_seconds", 0)))
+        table.add_row("", "")
+        table.add_row("[b]Counters[/b]", "")
         table.add_row("fresh", str(stats.get("fresh_total", 0)))
         table.add_row("reuse", str(stats.get("reuse_total", 0)))
-        table.add_row("rate", f"{float(stats.get('reuse_rate', 0.0)) * 100:.1f}%")
+        table.add_row("reuse rate", f"{float(stats.get('reuse_rate', 0.0)) * 100:.1f}%")
         table.add_row("spent", f"${float(stats.get('spent', 0.0)):.4f}")
         table.add_row("waiters", str(stats.get("cap_waiters", 0)))
+        table.add_row("", "")
+        table.add_row("[b]Active Leases[/b]", f"{stats.get('active', 0)}/{stats.get('max_active', 0)}")
         leases = list(_format_leases(stats.get("leases") or []))
         if leases:
-            table.add_row("leases", "\n".join(leases))
+            for lease in leases:
+                table.add_row("", lease)
+        else:
+            table.add_row("", "-")
         return table
 
 
@@ -131,3 +156,12 @@ def _format_leases(leases: Iterable[dict]) -> Iterable[str]:
         max_reuse = lease.get("max_reuse", 0)
         origin = "R" if lease.get("is_reused") else "F"
         yield f"{worker} {phone} {used}/{max_reuse} {origin}"
+
+
+def _shorten(value: str, width: int) -> str:
+    value = str(value or "")
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."

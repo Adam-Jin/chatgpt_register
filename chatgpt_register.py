@@ -1,5 +1,5 @@
 """
-ChatGPT 批量自动注册工具 (并发版) - DuckMail 临时邮箱版
+ChatGPT 批量自动注册工具 (并发版)
 依赖: pip install curl_cffi
 功能: 使用 DuckMail 临时邮箱，并发自动注册 ChatGPT 账号，自动获取 OTP 验证码
 """
@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs, urlencode
 import urllib.error
 import urllib.request
+from typing import Any
 
 from curl_cffi import requests as curl_requests
 
@@ -62,10 +63,23 @@ except Exception:
     monitor = None
 
 try:
+    import questionary
+except Exception as _questionary_import_exc:
+    questionary = None
+    _QUESTIONARY_IMPORT_ERROR = _questionary_import_exc
+else:
+    _QUESTIONARY_IMPORT_ERROR = None
+
+try:
     from qq_mail_pool import get_pool as _get_qq_mail_pool, extract_otp as _qq_extract_otp
 except Exception:
     _get_qq_mail_pool = None
     _qq_extract_otp = None
+
+try:
+    from addy_pool import get_pool as _get_addy_pool
+except Exception:
+    _get_addy_pool = None
 
 # 全局线程锁
 _print_lock = threading.Lock()
@@ -107,6 +121,8 @@ def _load_config():
         "total_accounts": 3,
         "duckmail_api_base": "https://api.duckmail.sbs",
         "duckmail_bearer": "",
+        "default_email_source": "",
+        "email_sources": [],
         "proxy": "",
         "output_file": "registered_accounts.txt",
         "enable_oauth": True,
@@ -195,6 +211,493 @@ def _is_interactive():
         return False
 
 
+def _normalize_questionary_choices(choices):
+    normalized = []
+    for item in choices:
+        if isinstance(item, dict):
+            normalized.append({
+                "title": str(item.get("title") or item.get("name") or item.get("value") or ""),
+                "value": item.get("value"),
+            })
+        else:
+            normalized.append({"title": str(item), "value": item})
+    return [item for item in normalized if item["title"]]
+
+
+def _prompt_select(message: str, choices, default: Any = None):
+    normalized = _normalize_questionary_choices(choices)
+    if questionary is not None:
+        q_choices = [questionary.Choice(title=item["title"], value=item["value"]) for item in normalized]
+        try:
+            result = questionary.select(message, choices=q_choices, default=default).ask()
+            if result is None:
+                raise KeyboardInterrupt
+            return result
+        except Exception as e:
+            _console_log(f"[Warn] questionary.select 失败，回退到 input: {e}", level="warn")
+    for idx, item in enumerate(normalized, start=1):
+        _console_log(f"[{idx}] {item['title']}")
+    raw = input(f"{message}: ").strip()
+    if raw.isdigit():
+        pick = int(raw)
+        if 1 <= pick <= len(normalized):
+            return normalized[pick - 1]["value"]
+    return default
+
+
+def _prompt_text(message: str, default: str = "") -> str:
+    if questionary is not None:
+        try:
+            result = questionary.text(message, default=default or "").ask()
+            if result is None:
+                raise KeyboardInterrupt
+            return (result or "").strip()
+        except Exception as e:
+            _console_log(f"[Warn] questionary.text 失败，回退到 input: {e}", level="warn")
+    prompt = f"{message}"
+    if default:
+        prompt += f" (默认 {default})"
+    prompt += ": "
+    return input(prompt).strip()
+
+
+def _prompt_confirm(message: str, default: bool = True) -> bool:
+    if questionary is not None:
+        try:
+            result = questionary.confirm(message, default=default).ask()
+            if result is None:
+                raise KeyboardInterrupt
+            return bool(result)
+        except Exception as e:
+            _console_log(f"[Warn] questionary.confirm 失败，回退到 input: {e}", level="warn")
+    suffix = "Y/n" if default else "y/N"
+    raw = input(f"{message} ({suffix}): ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes", "1", "true"}
+
+
+def _normalize_imap_profile(raw, fallback_key="default"):
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or raw.get("id") or raw.get("key") or fallback_key).strip()
+    key = str(raw.get("key") or raw.get("id") or name).strip() or fallback_key
+    host = str(raw.get("host") or raw.get("imap_host") or raw.get("mail_imap_host") or "").strip()
+    port = int(raw.get("port") or raw.get("imap_port") or raw.get("mail_imap_port") or 993)
+    user = str(raw.get("user") or raw.get("imap_user") or raw.get("mail_imap_user") or "").strip()
+    password = str(
+        raw.get("password")
+        or raw.get("authcode")
+        or raw.get("imap_password")
+        or raw.get("mail_imap_password")
+        or raw.get("mail_imap_authcode")
+        or ""
+    ).strip()
+    folder = str(raw.get("folder") or raw.get("imap_folder") or raw.get("mail_imap_folder") or "INBOX").strip() or "INBOX"
+    security = str(
+        raw.get("security")
+        or raw.get("imap_security")
+        or raw.get("ssl_mode")
+        or raw.get("mail_imap_security")
+        or ""
+    ).strip().lower()
+    security = {
+        "": "auto",
+        "auto": "auto",
+        "ssl": "ssl",
+        "implicit_ssl": "ssl",
+        "tls": "starttls",
+        "starttls": "starttls",
+        "plain": "plain",
+        "none": "plain",
+    }.get(security, security or "auto")
+    domain = str(raw.get("domain") or raw.get("mail_domain") or "").strip().lower().lstrip("@")
+    enabled = _as_bool(raw.get("enabled", True))
+    return {
+        "key": key,
+        "name": name,
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "folder": folder,
+        "security": security,
+        "domain": domain,
+        "enabled": enabled,
+    }
+
+
+def _load_imap_profiles(config):
+    profiles = []
+    raw_profiles = config.get("imap_profiles")
+    if isinstance(raw_profiles, list):
+        for idx, item in enumerate(raw_profiles, start=1):
+            profile = _normalize_imap_profile(item, fallback_key=f"imap{idx}")
+            if profile and profile["enabled"] and profile["host"] and profile["user"] and profile["password"]:
+                profiles.append(profile)
+
+    legacy_profile = _normalize_imap_profile(
+        {
+            "key": config.get("mail_imap_profile_key") or "default",
+            "name": config.get("mail_imap_profile_name") or "default",
+            "host": config.get("mail_imap_host") or config.get("qq_imap_host", ""),
+            "port": config.get("mail_imap_port") or config.get("qq_imap_port", 993),
+            "user": config.get("mail_imap_user") or config.get("qq_imap_user", ""),
+            "password": (
+                config.get("mail_imap_password")
+                or config.get("mail_imap_authcode")
+                or config.get("qq_imap_authcode", "")
+            ),
+            "folder": config.get("mail_imap_folder") or config.get("qq_imap_folder", "INBOX"),
+            "domain": config.get("mail_domain", ""),
+            "enabled": True,
+        }
+    )
+    if legacy_profile and legacy_profile["host"] and legacy_profile["user"] and legacy_profile["password"]:
+        duplicate = any(
+            p["key"] == legacy_profile["key"]
+            or (
+                p["host"] == legacy_profile["host"]
+                and int(p["port"]) == int(legacy_profile["port"])
+                and p["user"] == legacy_profile["user"]
+                and p["folder"] == legacy_profile["folder"]
+            )
+            for p in profiles
+        )
+        if not duplicate:
+            profiles.insert(0, legacy_profile)
+    return profiles
+
+
+def _normalize_email_source(raw, fallback_key="source"):
+    if not isinstance(raw, dict):
+        return None
+    key = str(raw.get("key") or raw.get("id") or fallback_key).strip() or fallback_key
+    name = str(raw.get("name") or key).strip() or key
+    source_type = str(raw.get("type") or raw.get("kind") or "").strip().lower()
+    aliases = {
+        "domain_catchall": "forward_domain",
+        "forward": "forward_domain",
+        "imap": "imap_mailbox",
+        "imap_profile": "imap_mailbox",
+        "mailbox": "imap_mailbox",
+        "addy.io": "addy",
+        "anonaddy": "addy",
+    }
+    source_type = aliases.get(source_type, source_type)
+    domain = str(raw.get("domain") or "").strip().lower().lstrip("@")
+    receiver = str(
+        raw.get("receiver")
+        or raw.get("receiver_profile")
+        or raw.get("imap_profile")
+        or raw.get("profile")
+        or ""
+    ).strip()
+    address = str(raw.get("address") or raw.get("email") or "").strip()
+    address_mode = str(
+        raw.get("address_mode")
+        or raw.get("mailbox_mode")
+        or raw.get("alias_mode")
+        or ""
+    ).strip().lower()
+    address_mode = {
+        "": "fixed",
+        "fixed": "fixed",
+        "single": "fixed",
+        "mailbox": "fixed",
+        "suffix": "suffix_alias",
+        "append": "suffix_alias",
+        "alias": "suffix_alias",
+        "local_suffix": "suffix_alias",
+        "suffix_alias": "suffix_alias",
+    }.get(address_mode, address_mode or "fixed")
+    enabled = _as_bool(raw.get("enabled", True))
+    api_key = str(raw.get("api_key") or raw.get("token") or "").strip()
+    base_url = str(raw.get("base_url") or "").strip()
+    recipient_ids = raw.get("recipient_ids") or []
+    if isinstance(recipient_ids, str):
+        recipient_ids = [s.strip() for s in recipient_ids.split(",") if s.strip()]
+    elif not isinstance(recipient_ids, list):
+        recipient_ids = []
+    delete_on_release = _as_bool(raw.get("delete_on_release", False))
+    deactivate_on_release = _as_bool(raw.get("deactivate_on_release", False))
+    description = str(raw.get("description") or "").strip()
+    addy_format = str(raw.get("format") or "custom").strip().lower() or "custom"
+    return {
+        "key": key,
+        "name": name,
+        "type": source_type,
+        "domain": domain,
+        "receiver": receiver,
+        "address": address,
+        "address_mode": address_mode,
+        "enabled": enabled,
+        "api_key": api_key,
+        "base_url": base_url,
+        "recipient_ids": list(recipient_ids),
+        "delete_on_release": delete_on_release,
+        "deactivate_on_release": deactivate_on_release,
+        "description": description,
+        "format": addy_format,
+    }
+
+
+def _mailbox_signature(profile):
+    if not profile:
+        return None
+    return (
+        profile.get("host", ""),
+        int(profile.get("port") or 993),
+        profile.get("user", ""),
+        profile.get("folder", "INBOX"),
+    )
+
+
+def _build_forward_domain_source(profile, key_hint="default"):
+    domain = str(profile.get("domain") or "").strip().lower().lstrip("@")
+    if not domain:
+        return None
+    return {
+        "key": str(key_hint or profile["key"]).strip() or profile["key"],
+        "name": f"{domain} -> {profile['name']}",
+        "type": "forward_domain",
+        "domain": domain,
+        "receiver": profile["key"],
+        "address": "",
+        "enabled": True,
+    }
+
+
+def _build_mailbox_source(profile):
+    if not profile or not profile.get("user"):
+        return None
+    return {
+        "key": profile["key"],
+        "name": profile["name"],
+        "type": "imap_mailbox",
+        "domain": "",
+        "receiver": profile["key"],
+        "address": profile["user"],
+        "address_mode": "fixed",
+        "enabled": True,
+    }
+
+
+def _validate_email_source(source):
+    if not source or not source["enabled"]:
+        return False
+    if source["type"] in {"duckmail", "custom"}:
+        return True
+    profile = _get_imap_profile(source["receiver"])
+    if not profile:
+        return False
+    if source["type"] == "forward_domain":
+        return bool(source["domain"])
+    if source["type"] == "imap_mailbox":
+        source["address"] = source["address"] or profile["user"]
+        return bool(source["address"])
+    if source["type"] == "addy":
+        return bool(source["domain"] and source.get("api_key"))
+    return False
+
+
+def _load_email_sources(config):
+    sources = []
+    seen = set()
+    raw_sources = config.get("email_sources")
+    if isinstance(raw_sources, list):
+        for idx, item in enumerate(raw_sources, start=1):
+            source = _normalize_email_source(item, fallback_key=f"source{idx}")
+            if not source or source["key"] in seen:
+                continue
+            if _validate_email_source(source):
+                sources.append(source)
+                seen.add(source["key"])
+
+    if sources:
+        return sources
+
+    synth_seen = set()
+    for profile in IMAP_PROFILES:
+        signature = _mailbox_signature(profile)
+        if profile.get("domain"):
+            source = _build_forward_domain_source(profile, key_hint=profile["key"])
+            dedupe_key = ("forward_domain", profile.get("domain"), signature)
+        else:
+            source = _build_mailbox_source(profile)
+            dedupe_key = ("imap_mailbox", profile.get("user"), signature)
+        if not source or dedupe_key in synth_seen or source["key"] in seen:
+            continue
+        if _validate_email_source(source):
+            sources.append(source)
+            seen.add(source["key"])
+            synth_seen.add(dedupe_key)
+    return sources
+
+
+def _find_email_source_by_receiver(profile_key, *, preferred_type=""):
+    candidates = [source for source in EMAIL_SOURCES if source["receiver"] == profile_key]
+    if preferred_type:
+        for source in candidates:
+            if source["type"] == preferred_type:
+                return source
+    return candidates[0] if candidates else None
+
+
+def _source_provider_key(source_key):
+    return f"source:{source_key}"
+
+
+def _normalize_mail_provider(mail_provider):
+    value = (mail_provider or "").strip()
+    if not value:
+        return "duckmail"
+    if value in {"duckmail", "custom"}:
+        return value
+    if value.startswith("source:"):
+        key = value.split(":", 1)[1].strip()
+        return value if key in EMAIL_SOURCES_BY_KEY else value
+    if value in EMAIL_SOURCES_BY_KEY:
+        return _source_provider_key(value)
+    if value == "domain_catchall":
+        return _source_provider_key(DEFAULT_EMAIL_SOURCE_KEY) if DEFAULT_EMAIL_SOURCE_KEY else value
+    if value.startswith("imap:"):
+        profile_key = value.split(":", 1)[1].strip()
+        source = _find_email_source_by_receiver(profile_key, preferred_type="forward_domain")
+        if not source:
+            source = _find_email_source_by_receiver(profile_key, preferred_type="imap_mailbox")
+        if source:
+            return _source_provider_key(source["key"])
+    return value
+
+
+def _get_email_source(source_key=""):
+    key = (source_key or DEFAULT_EMAIL_SOURCE_KEY or "").strip()
+    if not key:
+        return None
+    return EMAIL_SOURCES_BY_KEY.get(key)
+
+
+def _get_email_source_for_provider(mail_provider):
+    normalized = _normalize_mail_provider(mail_provider)
+    if normalized.startswith("source:"):
+        return _get_email_source(normalized.split(":", 1)[1].strip())
+    return None
+
+
+def _mail_provider_is_imap(mail_provider):
+    source = _get_email_source_for_provider(mail_provider)
+    return bool(source and source["type"] in {"forward_domain", "imap_mailbox", "addy"})
+
+
+def _mail_provider_profile_key(mail_provider):
+    source = _get_email_source_for_provider(mail_provider)
+    if source:
+        return source["receiver"]
+    return ""
+
+
+def _get_imap_profile(profile_key=""):
+    key = (profile_key or DEFAULT_IMAP_PROFILE_KEY or "").strip()
+    if not key:
+        return None
+    return IMAP_PROFILES_BY_KEY.get(key)
+
+
+def _get_receiver_profile_for_source(source):
+    if not source:
+        return None
+    return _get_imap_profile(source.get("receiver", ""))
+
+
+def _get_source_mail_domain(source):
+    if not source:
+        return ""
+    if source["type"] in ("forward_domain", "addy"):
+        return source["domain"]
+    if source["type"] == "imap_mailbox":
+        address = source["address"] or ""
+        if "@" in address:
+            return address.split("@", 1)[1].strip().lower()
+    return ""
+
+
+def _email_source_uses_suffix_alias(source):
+    return bool(
+        source
+        and source.get("type") == "imap_mailbox"
+        and source.get("address_mode", "fixed") == "suffix_alias"
+    )
+
+
+def _email_source_requires_single_address(source):
+    return bool(source and source.get("type") == "imap_mailbox" and not _email_source_uses_suffix_alias(source))
+
+
+def _describe_email_source(source):
+    if not source:
+        return "未配置"
+    profile = _get_receiver_profile_for_source(source)
+    if source["type"] == "forward_domain":
+        target = profile["user"] if profile else "?"
+        return f"域名邮箱: *@{source['domain']} -> {target}"
+    if source["type"] == "addy":
+        target = profile["user"] if profile else "?"
+        return f"addy.io 别名: *@{source['domain']} -> {target}"
+    if source["type"] == "imap_mailbox":
+        address = source["address"] or (profile["user"] if profile else "?")
+        if _email_source_uses_suffix_alias(source) and "@" in address:
+            local, domain = address.split("@", 1)
+            return f"邮箱别名: {local}<suffix>@{domain}"
+        return f"邮箱收件箱: {address}"
+    if source["type"] == "custom":
+        return "指定邮箱"
+    return "DuckMail 临时邮箱"
+
+
+def _build_imap_pool_config(profile, domain):
+    if not profile or not domain:
+        return None
+    return {
+        "mail_imap_host": profile["host"],
+        "mail_imap_port": profile["port"],
+        "mail_imap_user": profile["user"],
+        "mail_imap_password": profile["password"],
+        "mail_imap_folder": profile["folder"],
+        "mail_imap_security": profile.get("security", "auto"),
+        "mail_domain": domain,
+        "mail_poll_interval": _CONFIG.get("mail_poll_interval", 4),
+        "mail_debug": bool(_CONFIG.get("mail_debug", False)),
+    }
+
+
+def _get_mail_pool_for_provider(mail_provider):
+    if not _mail_provider_is_imap(mail_provider) or not _get_qq_mail_pool:
+        return None
+    source = _get_email_source_for_provider(mail_provider)
+    profile = _get_imap_profile(_mail_provider_profile_key(mail_provider))
+    domain = _get_source_mail_domain(source)
+    if not source or not profile or not domain:
+        return None
+    log = monitor.channel("email") if monitor is not None else None
+    imap_cfg = _build_imap_pool_config(profile, domain)
+    if source["type"] == "addy":
+        if not _get_addy_pool:
+            return None
+        addy_cfg = {
+            "api_key": source.get("api_key", ""),
+            "domain": domain,
+            "base_url": source.get("base_url") or "",
+            "recipient_ids": source.get("recipient_ids") or [],
+            "description": source.get("description") or "",
+            "delete_on_release": source.get("delete_on_release", False),
+            "deactivate_on_release": source.get("deactivate_on_release", False),
+            "format": source.get("format") or "custom",
+        }
+        return _get_addy_pool(addy_cfg, imap_cfg, log=log)
+    return _get_qq_mail_pool(imap_cfg, log=log)
+
+
 _CONFIG = _load_config()
 DUCKMAIL_API_BASE = _CONFIG["duckmail_api_base"]
 DUCKMAIL_BEARER = _CONFIG["duckmail_bearer"]
@@ -228,7 +731,18 @@ PHONE_MAX_ACTIVE = int(_CONFIG.get("phone_max_active") or 0)
 PHONE_ACQUIRE_TIMEOUT = float(_CONFIG.get("phone_acquire_timeout", 60.0))
 PHONE_POOL_LEASE_SECONDS = int(_CONFIG.get("phone_pool_lease_seconds", 60))
 PHONE_POOL_HEARTBEAT_SECONDS = int(_CONFIG.get("phone_pool_heartbeat_seconds", 30))
+RETRY_OAUTH_DEFAULT_WORKERS = 2
 PHONE_POOL_ENABLED = bool(_CONFIG.get("phone_pool_enabled", True))
+IMAP_PROFILES = _load_imap_profiles(_CONFIG)
+IMAP_PROFILES_BY_KEY = {profile["key"]: profile for profile in IMAP_PROFILES}
+DEFAULT_IMAP_PROFILE_KEY = IMAP_PROFILES[0]["key"] if IMAP_PROFILES else ""
+EMAIL_SOURCES = _load_email_sources(_CONFIG)
+EMAIL_SOURCES_BY_KEY = {source["key"]: source for source in EMAIL_SOURCES}
+DEFAULT_EMAIL_SOURCE_KEY = (
+    str(_CONFIG.get("default_email_source") or "").strip()
+    if str(_CONFIG.get("default_email_source") or "").strip() in EMAIL_SOURCES_BY_KEY
+    else (EMAIL_SOURCES[0]["key"] if EMAIL_SOURCES else "")
+)
 
 # 全局共享的号池 (跨注册线程共享 lease 状态; 进程内单例)
 _phone_pool_singleton = None
@@ -355,11 +869,13 @@ def _get_phone_pool():
             _system_log(f"phone_pool 初始化失败, 走单次 acquire 模式: {e}", level="warn")
             return None
 
-# 自有域名 catch-all (Cloudflare Email Routing → QQ) 配置
-QQ_IMAP_USER = _CONFIG.get("qq_imap_user", "")
-QQ_IMAP_AUTHCODE = _CONFIG.get("qq_imap_authcode", "")
-MAIL_DOMAIN = _CONFIG.get("mail_domain", "")
-HAS_DOMAIN_CATCHALL = bool(QQ_IMAP_USER and QQ_IMAP_AUTHCODE and MAIL_DOMAIN)
+# 自有域名/IMAP 邮箱配置
+DEFAULT_EMAIL_SOURCE = _get_email_source()
+DEFAULT_IMAP_PROFILE = _get_imap_profile(_mail_provider_profile_key(_source_provider_key(DEFAULT_EMAIL_SOURCE_KEY)))
+QQ_IMAP_USER = DEFAULT_IMAP_PROFILE["user"] if DEFAULT_IMAP_PROFILE else ""
+QQ_IMAP_AUTHCODE = DEFAULT_IMAP_PROFILE["password"] if DEFAULT_IMAP_PROFILE else ""
+MAIL_DOMAIN = DEFAULT_EMAIL_SOURCE["domain"] if DEFAULT_EMAIL_SOURCE and DEFAULT_EMAIL_SOURCE["type"] in ("forward_domain", "addy") else ""
+HAS_DOMAIN_CATCHALL = bool(DEFAULT_EMAIL_SOURCE and DEFAULT_EMAIL_SOURCE["type"] in ("forward_domain", "addy"))
 
 if not DUCKMAIL_BEARER:
     _console_block([
@@ -736,6 +1252,139 @@ def _decode_jwt_payload(token: str):
         return {}
 
 
+def _extract_code_from_input(raw: str):
+    value = (raw or "").strip()
+    if not value:
+        return None
+    return _extract_code_from_url(value) or value
+
+
+def _infer_email_from_tokens(tokens: dict):
+    access_payload = _decode_jwt_payload(tokens.get("access_token", ""))
+    profile = access_payload.get("https://api.openai.com/profile", {})
+    email = str(profile.get("email") or access_payload.get("email") or "").strip()
+    if email:
+        return email
+    id_payload = _decode_jwt_payload(tokens.get("id_token", ""))
+    return str(id_payload.get("email") or "").strip()
+
+
+def _build_codex_token_data(email: str, tokens: dict):
+    access_token = tokens.get("access_token", "")
+    refresh_token = tokens.get("refresh_token", "")
+    id_token = tokens.get("id_token", "")
+    if not access_token:
+        return None
+
+    payload = _decode_jwt_payload(access_token)
+    auth_info = payload.get("https://api.openai.com/auth", {})
+    account_id = auth_info.get("chatgpt_account_id", "")
+
+    exp_timestamp = payload.get("exp")
+    expired_str = ""
+    if isinstance(exp_timestamp, int) and exp_timestamp > 0:
+        from datetime import datetime, timezone, timedelta
+
+        exp_dt = datetime.fromtimestamp(exp_timestamp, tz=timezone(timedelta(hours=8)))
+        expired_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+    from datetime import datetime, timezone, timedelta
+
+    now = datetime.now(tz=timezone(timedelta(hours=8)))
+    return {
+        "type": "codex",
+        "email": email,
+        "expired": expired_str,
+        "id_token": id_token,
+        "account_id": account_id,
+        "access_token": access_token,
+        "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+        "refresh_token": refresh_token,
+    }
+
+
+def _make_auth_filename(filename_hint: str, fallback_stem: str = "auth"):
+    raw = (filename_hint or "").strip()
+    if not raw:
+        raw = fallback_stem
+    raw = os.path.basename(raw)
+    if raw.lower().endswith(".json"):
+        raw = raw[:-5]
+    raw = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip().strip(".")
+    raw = raw or fallback_stem or "auth"
+    return f"{raw}.json"
+
+
+def _persist_codex_token_data(token_data: dict, filename_hint: str = "",
+                              write_token_lines: bool = True, upload_to_cpa=None):
+    access_token = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+
+    if write_token_lines:
+        if access_token:
+            with _file_lock:
+                with open(AK_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{access_token}\n")
+
+        if refresh_token:
+            with _file_lock:
+                with open(RK_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{refresh_token}\n")
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
+    os.makedirs(token_dir, exist_ok=True)
+
+    fallback_stem = token_data.get("email") or "auth"
+    filename = _make_auth_filename(filename_hint, fallback_stem=fallback_stem)
+    token_path = os.path.join(token_dir, filename)
+    with _file_lock:
+        with open(token_path, "w", encoding="utf-8") as f:
+            json.dump(token_data, f, ensure_ascii=False)
+
+    if upload_to_cpa is None:
+        upload_to_cpa = bool(UPLOAD_API_URL)
+    if upload_to_cpa:
+        _upload_token_json(token_path)
+    return token_path
+
+
+def _exchange_codex_auth_code(code: str, code_verifier: str, proxy: str = None):
+    reg = ChatGPTRegister(proxy=proxy, tag="auth_from_code")
+    reg._print("[AuthFile] 开始用 authorization code 换 token")
+    token_resp = reg.session.post(
+        f"{OAUTH_ISSUER}/oauth/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": reg.ua},
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "client_id": OAUTH_CLIENT_ID,
+            "code_verifier": code_verifier,
+        },
+        timeout=60,
+        impersonate=reg.impersonate,
+    )
+    reg._print(f"[AuthFile] /oauth/token -> {token_resp.status_code}")
+
+    if token_resp.status_code != 200:
+        reg._print(f"[AuthFile] token 交换失败: {token_resp.status_code} {token_resp.text[:200]}")
+        return None
+
+    try:
+        data = token_resp.json()
+    except Exception:
+        reg._print("[AuthFile] token 响应解析失败")
+        return None
+
+    if not data.get("access_token"):
+        reg._print("[AuthFile] token 响应缺少 access_token")
+        return None
+
+    reg._print("[AuthFile] Codex Token 获取成功")
+    return data
+
+
 PENDING_OAUTH_FILE = "pending_oauth.txt"
 
 
@@ -754,61 +1403,10 @@ def _append_pending_oauth(email: str, password: str, email_pwd: str, mail_provid
 
 
 def _save_codex_tokens(email: str, tokens: dict):
-    access_token = tokens.get("access_token", "")
-    refresh_token = tokens.get("refresh_token", "")
-    id_token = tokens.get("id_token", "")
-
-    if access_token:
-        with _file_lock:
-            with open(AK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{access_token}\n")
-
-    if refresh_token:
-        with _file_lock:
-            with open(RK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{refresh_token}\n")
-
-    if not access_token:
+    token_data = _build_codex_token_data(email, tokens)
+    if not token_data:
         return
-
-    payload = _decode_jwt_payload(access_token)
-    auth_info = payload.get("https://api.openai.com/auth", {})
-    account_id = auth_info.get("chatgpt_account_id", "")
-
-    exp_timestamp = payload.get("exp")
-    expired_str = ""
-    if isinstance(exp_timestamp, int) and exp_timestamp > 0:
-        from datetime import datetime, timezone, timedelta
-
-        exp_dt = datetime.fromtimestamp(exp_timestamp, tz=timezone(timedelta(hours=8)))
-        expired_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-
-    from datetime import datetime, timezone, timedelta
-
-    now = datetime.now(tz=timezone(timedelta(hours=8)))
-    token_data = {
-        "type": "codex",
-        "email": email,
-        "expired": expired_str,
-        "id_token": id_token,
-        "account_id": account_id,
-        "access_token": access_token,
-        "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
-        "refresh_token": refresh_token,
-    }
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
-    os.makedirs(token_dir, exist_ok=True)
-
-    token_path = os.path.join(token_dir, f"{email}.json")
-    with _file_lock:
-        with open(token_path, "w", encoding="utf-8") as f:
-            json.dump(token_data, f, ensure_ascii=False)
-
-    # 上传到 CPA 管理平台
-    if UPLOAD_API_URL:
-        _upload_token_json(token_path)
+    _persist_codex_token_data(token_data, filename_hint=email, write_token_lines=True, upload_to_cpa=None)
 
 
 def _upload_token_json(filepath):
@@ -1248,14 +1846,14 @@ class ChatGPTRegister:
 
     def wait_for_verification_email(self, mail_token: str, timeout: int = 120):
         """等待并提取 OpenAI 验证码。
-        优先级: QQ catch-all 池 > DuckMail > 手动输入。
+        优先级: IMAP 收件池 > DuckMail > 手动输入。
         """
         # 1. QQ 自有域名 catch-all 池
         qq_pool = getattr(self, "qq_pool", None)
         qq_addr = getattr(self, "qq_pool_email", None)
         if qq_pool and qq_addr:
             since = getattr(self, "qq_pool_since", None)
-            self._print(f"[OTP] (QQ catch-all) 等待 {qq_addr} 的 OTP, 最多 {timeout}s ...")
+            self._print(f"[OTP] (IMAP) 等待 {qq_addr} 的 OTP, 最多 {timeout}s ...")
             code = qq_pool.wait_for_otp(qq_addr, timeout=timeout, since_ts=since)
             if code:
                 self._print(f"[OTP] 验证码: {code}")
@@ -1408,6 +2006,16 @@ class ChatGPTRegister:
         headers = {"Content-Type": "application/json", "Accept": "application/json",
                     "Referer": f"{self.AUTH}/about-you", "Origin": self.AUTH}
         headers.update(_make_trace_headers())
+
+        sentinel = _request_sentinel_token(
+            "oauth_create_account", self.device_id, self.ua, proxy=self.proxy,
+        )
+        if sentinel:
+            headers["openai-sentinel-token"] = sentinel
+            self._print("[Sentinel] create_account token 已附加")
+        else:
+            self._print("[Sentinel] create_account token 获取失败，继续裸跑")
+
         r = self.session.post(url, json={"name": name, "birthdate": birthdate}, headers=headers)
         try: data = r.json()
         except Exception: data = {"text": r.text[:500]}
@@ -2063,6 +2671,25 @@ class ChatGPTRegister:
             if resp_org.status_code >= 400:
                 self._print(f"[OAuth] organization/select 错误: body={resp_org.text[:300]} "
                             f"req_body={org_body}")
+                if (
+                    resp_org.status_code == 400
+                    and project_id
+                    and "duplicate" in resp_org.text.lower()
+                ):
+                    org_body = {"org_id": org_id}
+                    self._print("[OAuth] organization/select duplicate, 去掉 project_id 重试")
+                    resp_org = self.session.post(
+                        f"{OAUTH_ISSUER}/api/accounts/organization/select",
+                        json=org_body,
+                        headers=h_org,
+                        allow_redirects=False,
+                        timeout=30,
+                        impersonate=self.impersonate,
+                    )
+                    self._print(f"[OAuth] organization/select(retry) -> {resp_org.status_code}")
+                    if resp_org.status_code >= 400:
+                        self._print(f"[OAuth] organization/select(retry) 错误: "
+                                    f"body={resp_org.text[:300]} req_body={org_body}")
             if resp_org.status_code in (301, 302, 303, 307, 308):
                 loc = resp_org.headers.get("Location", "")
                 if loc.startswith("/"):
@@ -2367,7 +2994,7 @@ class ChatGPTRegister:
                     return None
 
             if qq_pool and qq_addr:
-                self._print(f"[OAuth] (QQ) MFA OTP 基线时间戳设为 {int(qq_since)}")
+                self._print(f"[OAuth] (IMAP) MFA OTP 基线时间戳设为 {int(qq_since)}")
                 while not mfa_success and time.time() < mfa_deadline:
                     items = qq_pool.get_messages_since(qq_addr, since_ts=qq_since or 0)
                     candidate_codes = []
@@ -2377,12 +3004,12 @@ class ChatGPTRegister:
                             candidate_codes.append(code_)
                     if not candidate_codes:
                         elapsed = int(120 - max(0, mfa_deadline - time.time()))
-                        self._print(f"[OAuth] (QQ) MFA OTP 等待中... ({elapsed}s/120s)")
+                        self._print(f"[OAuth] (IMAP) MFA OTP 等待中... ({elapsed}s/120s)")
                         time.sleep(2)
                         continue
                     for otp_code in candidate_codes:
                         tried_codes.add(otp_code)
-                        self._print(f"[OAuth] (QQ) 尝试 MFA OTP: {otp_code}")
+                        self._print(f"[OAuth] (IMAP) 尝试 MFA OTP: {otp_code}")
                         data = _submit_mfa_code(otp_code)
                         if data is None:
                             continue
@@ -2395,7 +3022,7 @@ class ChatGPTRegister:
                     if not mfa_success:
                         time.sleep(2)
                 if not mfa_success:
-                    self._print(f"[OAuth] (QQ) MFA OTP 验证失败, 已尝试 {len(tried_codes)} 个")
+                    self._print(f"[OAuth] (IMAP) MFA OTP 验证失败, 已尝试 {len(tried_codes)} 个")
                     return None
 
             elif not mail_token:
@@ -2474,7 +3101,7 @@ class ChatGPTRegister:
             otp_success = False
             otp_deadline = time.time() + 120
 
-            # QQ catch-all 池: 复用 candidate_codes 模式 (OpenAI 可能多次重发, 取最新)
+            # IMAP 收件池: 复用 candidate_codes 模式 (OpenAI 可能多次重发, 取最新)
             qq_pool = getattr(self, "qq_pool", None)
             qq_addr = getattr(self, "qq_pool_email", None)
             # OAuth 阶段触发的是一封"新"OTP, 必须忽略注册阶段或上一次 OAuth 留下的旧 OTP。
@@ -2483,7 +3110,7 @@ class ChatGPTRegister:
             qq_since = max(time.time() - 10, getattr(self, "qq_pool_since", 0) or 0)
             self.qq_pool_since = qq_since  # 让 wait_for_verification_email 等其它路径也共用
             if qq_pool and qq_addr:
-                self._print(f"[OAuth] (QQ) OTP 基线时间戳设为 {int(qq_since)} (只看之后到达的邮件)")
+                self._print(f"[OAuth] (IMAP) OTP 基线时间戳设为 {int(qq_since)} (只看之后到达的邮件)")
                 while not otp_success and time.time() < otp_deadline:
                     items = qq_pool.get_messages_since(qq_addr, since_ts=qq_since or 0)
                     candidate_codes = []
@@ -2493,12 +3120,12 @@ class ChatGPTRegister:
                             candidate_codes.append(code)
                     if not candidate_codes:
                         elapsed = int(120 - max(0, otp_deadline - time.time()))
-                        self._print(f"[OAuth] (QQ) OTP 等待中... ({elapsed}s/120s)")
+                        self._print(f"[OAuth] (IMAP) OTP 等待中... ({elapsed}s/120s)")
                         time.sleep(2)
                         continue
                     for otp_code in candidate_codes:
                         tried_codes.add(otp_code)
-                        self._print(f"[OAuth] (QQ) 尝试 OTP: {otp_code}")
+                        self._print(f"[OAuth] (IMAP) 尝试 OTP: {otp_code}")
                         try:
                             resp_otp = self.session.post(
                                 f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
@@ -2528,7 +3155,7 @@ class ChatGPTRegister:
                     if not otp_success:
                         time.sleep(2)
                 if not otp_success:
-                    self._print(f"[OAuth] (QQ) OTP 验证失败, 已尝试 {len(tried_codes)} 个")
+                    self._print(f"[OAuth] (IMAP) OTP 验证失败, 已尝试 {len(tried_codes)} 个")
                     return None
 
             # 指定邮箱模式：直接询问用户手动输入
@@ -2740,7 +3367,7 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
     """单个注册任务 (在线程中运行)
     mail_provider:
       - "duckmail"        : DuckMail 临时邮箱 (默认)
-      - "domain_catchall" : 自有域名 catch-all → QQ 邮箱
+      - "source:<key>"    : 使用 email_sources 中定义的注册来源
       - "custom"          : custom_email 指定邮箱 + 手动 OTP
     """
     reg = None
@@ -2748,32 +3375,59 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
     qq_addr = None
     try:
         reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}")
+        mail_provider = _normalize_mail_provider(mail_provider)
+        source = _get_email_source_for_provider(mail_provider)
 
         if mail_provider == "custom" or custom_email:
             email = custom_email
             email_pwd = "(user-provided)"
             mail_token = None
             reg._print(f"[Custom] 使用指定邮箱: {email}")
-        elif mail_provider == "domain_catchall":
-            qq_pool = _get_qq_mail_pool(
-                _CONFIG,
-                log=monitor.channel("email") if monitor is not None else None,
-            ) if _get_qq_mail_pool else None
+        elif _mail_provider_is_imap(mail_provider):
+            profile = _get_receiver_profile_for_source(source)
+            qq_pool = _get_mail_pool_for_provider(mail_provider)
+            if not profile:
+                raise Exception("所选邮箱来源缺少有效 receiver 配置")
             if not qq_pool:
-                raise Exception("QQ catch-all 池未初始化, 检查 config.json 中 qq_imap_user/authcode/mail_domain")
-            qq_addr = qq_pool.acquire_email()
-            email = qq_addr
-            email_pwd = "(catchall→QQ)"
+                raise Exception(
+                    "IMAP 收件池未初始化, 检查 config.json 中 "
+                    "imap_profiles / email_sources 配置"
+                )
+            if source["type"] == "forward_domain":
+                qq_addr = qq_pool.acquire_email(domain=source["domain"])
+                email = qq_addr
+                email_pwd = "(forward-domain→IMAP)"
+                reg._print(
+                    f"[MailSource] 域名转发: {email} -> {profile['user']} | source={source['name']}"
+                )
+            elif source["type"] == "addy":
+                qq_addr = qq_pool.acquire_email(domain=source["domain"])
+                email = qq_addr
+                email_pwd = "(addy.io alias→IMAP)"
+                reg._print(
+                    f"[MailSource] addy.io 别名: {email} -> {profile['user']} | source={source['name']}"
+                )
+            else:
+                base_address = source["address"] or profile["user"]
+                if _email_source_uses_suffix_alias(source):
+                    qq_addr = qq_pool.acquire_email(base_address=base_address)
+                    email = qq_addr
+                    email_pwd = "(imap-mailbox-alias)"
+                    reg._print(
+                        f"[MailSource] IMAP 子邮箱: {email} -> {profile['user']} | source={source['name']}"
+                    )
+                else:
+                    email = base_address
+                    qq_addr = email
+                    email_pwd = "(imap-mailbox)"
+                    reg._print(
+                        f"[MailSource] 使用 IMAP 邮箱: {email} | source={source['name']}"
+                    )
             mail_token = None
-            # 注入到 reg, 让 wait_for_verification_email / OAuth OTP 路径能用上
-            # 不设 qq_pool_since: 该地址唯一, 第一封到达的邮件就是给它的
-            # baseline UID 已经过滤掉历史邮件
             reg.qq_pool = qq_pool
-            reg.qq_pool_email = qq_addr
+            reg.qq_pool_email = email
             reg.qq_pool_since = None
-            reg._print(f"[QQ-CatchAll] 分配邮箱: {email}")
         else:
-            # DuckMail 临时邮箱
             reg._print("[DuckMail] 创建临时邮箱...")
             email, email_pwd, mail_token = reg.create_temp_email()
         tag = email.split("@")[0]
@@ -2809,8 +3463,6 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
                 _save_codex_tokens(email, tokens)
                 reg._print("[OAuth] Token 已保存")
             else:
-                # 注册成功但 OAuth 失败: 不论 OAUTH_REQUIRED 是否为 true,
-                # 都先把账号信息落到 pending_oauth.txt, 后续可单独 retry
                 _append_pending_oauth(email, chatgpt_password, email_pwd, mail_provider)
                 msg = "OAuth 获取失败"
                 if OAUTH_REQUIRED:
@@ -2888,14 +3540,14 @@ def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, prox
     qq_addr = None
     try:
         reg = ChatGPTRegister(proxy=proxy, tag=email.split("@")[0])
+        mail_provider = _normalize_mail_provider(mail_provider)
 
-        # 注入 QQ catch-all 池: OAuth 阶段触发邮箱 OTP 时能自动取
-        if mail_provider == "domain_catchall" and qq_pool:
+        if _mail_provider_is_imap(mail_provider) and qq_pool:
             reg.qq_pool = qq_pool
             reg.qq_pool_email = email
             reg.qq_pool_since = None
             qq_addr = email
-            reg._print(f"[Retry] 已注入 QQ catch-all: {email}")
+            reg._print(f"[Retry] 已注入 IMAP 收件源: {email}")
 
         _worker_log(
             "\n".join([
@@ -2938,8 +3590,10 @@ def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, prox
 def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
                      output_file: str = "registered_accounts.txt",
                      proxy=None,
-                     max_workers: int = 1,
-                     mail_provider_override: str = ""):
+                     max_workers: int = RETRY_OAUTH_DEFAULT_WORKERS,
+                     mail_provider_override: str = "",
+                     *,
+                     with_monitor_runtime: bool = True):
     """补救入口: 读 pending_oauth.txt 中的 email+password, 只跑 OAuth + 存 token。
     成功的从 pending 文件移除并追加到 output_file (oauth=ok)。
     mail_provider_override: 强制覆盖每行的 mail_provider (例如统一用 domain_catchall)。
@@ -2949,47 +3603,103 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
         _console_log(f"[Retry] {path} 无可补救账号", level="warn")
         return
 
-    _console_block([
-        f"\n{'#'*60}",
-        "  OAuth 补救模式",
-        f"  输入: {path} ({len(items)} 个账号)",
-        f"  并发: {max_workers}",
-    ])
-    if mail_provider_override:
-        _console_log(f"  强制 mail_provider: {mail_provider_override}")
-    _console_log(f"{'#'*60}\n")
+    actual_workers = max(1, min(max_workers, len(items)))
+    if with_monitor_runtime and monitor is not None:
+        _reset_run_metrics()
+        _intake_paused_event.clear()
+        _shutdown_event.clear()
 
-    # 准备 QQ 池 (任何一行 mail_provider 是 domain_catchall, 或全局覆盖时)
-    qq_pool = None
-    need_pool = mail_provider_override == "domain_catchall" or any(
-        (mp == "domain_catchall") for (_, _, _, mp, _) in items
-    )
-    if need_pool:
-        if not HAS_DOMAIN_CATCHALL:
-            _console_block([
-                "[Retry] ⚠️ 需要 QQ catch-all 但 config.json 未配置 qq_imap_user/authcode/mail_domain",
-                "        将退化为手动 OTP 模式 (出现 OTP 时终端会 prompt)",
-            ], level="warn")
-        elif _get_qq_mail_pool:
-            qq_pool = _get_qq_mail_pool(
-                _CONFIG,
-                log=monitor.channel("email") if monitor is not None else None,
+        def _run_callable():
+            return retry_oauth_only(
+                input_file=input_file,
+                output_file=output_file,
+                proxy=proxy,
+                max_workers=max_workers,
+                mail_provider_override=mail_provider_override,
+                with_monitor_runtime=False,
             )
-            if qq_pool:
-                _console_log(f"[Retry] QQ-CatchAll 池已就绪: {QQ_IMAP_USER}", level="success")
-            else:
-                _console_log("[Retry] ⚠️ QQ 邮箱池初始化失败", level="error")
+
+        result = monitor.run_with_monitor(
+            _run_callable,
+            tui_enabled=_is_tui_enabled(),
+            max_workers=actual_workers,
+            summary_getter=_summary_snapshot,
+            inflight_getter=_inflight_workers_snapshot,
+            intake_paused=_intake_paused_event,
+            shutdown_event=_shutdown_event,
+        )
+        summary = _summary_snapshot()
+        _console_log(
+            f"retry summary: success={summary['success']} fail={summary['fail']}"
+            f" dropped={monitor.stats().get('dropped_events', 0)}",
+            level="success" if summary["success"] else "warn",
+        )
+        return result
+
+    _system_log(f"\n{'#'*60}")
+    _system_log("  OAuth 补救模式")
+    _system_log(f"  输入: {path} ({len(items)} 个账号)")
+    _system_log(f"  并发: {actual_workers}")
+    override_provider = _normalize_mail_provider(mail_provider_override) if mail_provider_override else ""
+    if override_provider:
+        _system_log(f"  强制 mail_provider: {override_provider}")
+    _system_log(f"{'#'*60}\n")
+
+    needed_imap_providers = set()
+    if _mail_provider_is_imap(override_provider):
+        needed_imap_providers.add(override_provider)
+    for _, _, _, mp, _ in items:
+        effective_mp = override_provider or _normalize_mail_provider(mp)
+        if _mail_provider_is_imap(effective_mp):
+            needed_imap_providers.add(effective_mp)
+
+    qq_pools = {}
+    for provider in sorted(needed_imap_providers):
+        source = _get_email_source_for_provider(provider)
+        profile = _get_receiver_profile_for_source(source)
+        if not profile:
+            _system_log(
+                "\n".join([
+                    f"[Retry] ⚠️ 找不到 IMAP 配置: {provider}",
+                    "        将退化为手动 OTP 模式 (出现 OTP 时终端会 prompt)",
+                ]),
+                level="warn",
+            )
+            continue
+        qq_pool = _get_mail_pool_for_provider(provider)
+        if qq_pool:
+            qq_pools[provider] = qq_pool
+            _system_log(
+                f"[Retry] IMAP 池已就绪: {source['name']} ({profile['user']})",
+                level="success",
+            )
+        else:
+            _system_log(f"[Retry] ⚠️ IMAP 邮箱池初始化失败: {source['name']}", level="error")
 
     success_emails = set()
     fail_emails = set()
-    actual_workers = max(1, min(max_workers, len(items)))
+    worker_slots: queue.Queue[str] = queue.Queue()
+    for i in range(actual_workers):
+        worker_slots.put(f"W{i + 1}")
 
     def _job(args):
         i, (email, password, email_pwd, mp, raw) = args
-        effective_mp = mail_provider_override or mp
-        ok, em, err = _retry_oauth_one(i + 1, len(items), email, password, email_pwd,
-                                        effective_mp, proxy, qq_pool)
-        return ok, em, raw
+        effective_mp = override_provider or _normalize_mail_provider(mp)
+        qq_pool = qq_pools.get(effective_mp)
+        worker_id = worker_slots.get()
+        _mark_worker_active(worker_id)
+        if monitor is not None:
+            monitor.set_current_worker(worker_id)
+        try:
+            ok, em, err = _retry_oauth_one(
+                i + 1, len(items), email, password, email_pwd, effective_mp, proxy, qq_pool
+            )
+            return ok, em, raw
+        finally:
+            if monitor is not None:
+                monitor.clear_current_worker()
+            _mark_worker_idle(worker_id)
+            worker_slots.put(worker_id)
 
     if actual_workers == 1:
         results = [_job(x) for x in enumerate(items)]
@@ -3004,8 +3714,11 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
     for ok, em, raw in results:
         if ok:
             success_emails.add(raw)
+            _bump_metric("success")
         else:
             fail_emails.add(raw)
+            _bump_metric("fail")
+        _bump_metric("done")
 
     # 把成功的从 pending 移除 (按原 raw 行匹配)
     remaining = [raw for (_, _, _, _, raw) in items if raw not in success_emails]
@@ -3021,21 +3734,26 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
                     if raw in success_emails:
                         out.write(f"{email}----{password}----{email_pwd}----oauth=ok (retry)\n")
 
-    _console_block([
-        f"\n{'#'*60}",
-        "  OAuth 补救完成",
+    _system_log(f"\n{'#'*60}")
+    _system_log("  OAuth 补救完成", level="success" if success_emails else "warn")
+    _system_log(
         f"  成功: {len(success_emails)} | 失败: {len(fail_emails)}",
+        level="success" if success_emails else "warn",
+    )
+    _system_log(
         f"  pending_oauth.txt 剩余: {len(remaining)}",
-        f"{'#'*60}\n",
-    ], level="success" if success_emails else "warn")
+        level="success" if success_emails else "warn",
+    )
+    _system_log(f"{'#'*60}\n", level="success" if success_emails else "warn")
 
 
 def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
               max_workers=3, proxy=None, custom_email=None,
               mail_provider="duckmail", *, with_monitor_runtime=True):
     """并发批量注册
-    mail_provider: "duckmail" | "domain_catchall" | "custom"
+    mail_provider: "duckmail" | "custom" | "source:<key>"
     """
+    mail_provider = _normalize_mail_provider(mail_provider)
 
     requested_workers = 1 if (custom_email or mail_provider == "custom") else max_workers
     actual_workers = min(requested_workers, total_accounts)
@@ -3083,21 +3801,21 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
             _system_log("[Info] 指定邮箱模式：强制 total_accounts=1, max_workers=1")
         total_accounts = 1
         max_workers = 1
-    elif mail_provider == "domain_catchall":
-        if not HAS_DOMAIN_CATCHALL:
-            _system_log("❌ 错误: domain_catchall 模式需要在 config.json 配置:", level="error")
-            _system_log("   qq_imap_user / qq_imap_authcode / mail_domain", level="error")
+    elif _mail_provider_is_imap(mail_provider):
+        source = _get_email_source_for_provider(mail_provider)
+        profile = _get_receiver_profile_for_source(source)
+        if not source or not profile:
+            _system_log("❌ 错误: 所选邮箱来源不存在或未配置完整", level="error")
             return
-        # 预热池 (启动后台 IMAP 线程, 等基线 UID 拿到再开 worker)
-        if _get_qq_mail_pool:
-            pool = _get_qq_mail_pool(
-                _CONFIG,
-                log=monitor.channel("email") if monitor is not None else None,
-            )
-            if not pool:
-                _system_log("❌ 错误: QQ 邮箱池初始化失败", level="error")
-                return
-            _system_log(f"[QQ-CatchAll] 池已就绪: {QQ_IMAP_USER} ← *@{MAIL_DOMAIN}")
+        pool = _get_mail_pool_for_provider(mail_provider)
+        if not pool:
+            _system_log(f"❌ 错误: IMAP 邮箱池初始化失败: {source['name']}", level="error")
+            return
+        if _email_source_requires_single_address(source) and (total_accounts != 1 or max_workers != 1):
+            _system_log("[Info] IMAP 单邮箱模式：强制 total_accounts=1, max_workers=1")
+            total_accounts = 1
+            max_workers = 1
+        _system_log(f"[MailSource] 池已就绪: {_describe_email_source(source)}")
     elif not DUCKMAIL_BEARER:
         _system_log("❌ 错误: 未设置 DUCKMAIL_BEARER 环境变量", level="error")
         _system_log("   请设置: export DUCKMAIL_BEARER='your_api_key_here'", level="error")
@@ -3113,10 +3831,11 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     _system_log(f"\n{'#'*60}")
     if mail_provider == "custom":
         mode_label = f"指定邮箱: {custom_email}"
-    elif mail_provider == "domain_catchall":
-        mode_label = f"自有域名 catch-all (*@{MAIL_DOMAIN} → QQ)"
+    elif _mail_provider_is_imap(mail_provider):
+        source = _get_email_source_for_provider(mail_provider)
+        mode_label = _describe_email_source(source)
     else:
-        mode_label = "DuckMail 临时邮箱版"
+        mode_label = "DuckMail 临时邮箱"
     _system_log(f"  ChatGPT 批量自动注册 ({mode_label})")
     _system_log(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
     if SENTINEL_INPROCESS:
@@ -3204,7 +3923,8 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
 
 def _parse_retry_oauth_args(argv):
     """解析 --retry-oauth [file] [--workers N] [--mail-provider X]
-    返回 (input_file, max_workers, mail_provider_override) 或 None (未启用 retry)。
+    返回 (input_file, max_workers, mail_provider_override, workers_explicit)
+    或 None (未启用 retry)。
     """
     if "--retry-oauth" not in argv:
         return None
@@ -3212,12 +3932,14 @@ def _parse_retry_oauth_args(argv):
     input_file = PENDING_OAUTH_FILE
     if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
         input_file = argv[i + 1]
-    max_workers = 1
+    max_workers = RETRY_OAUTH_DEFAULT_WORKERS
+    workers_explicit = False
     if "--workers" in argv:
         j = argv.index("--workers")
         if j + 1 < len(argv):
             try:
                 max_workers = max(1, int(argv[j + 1]))
+                workers_explicit = True
             except ValueError:
                 pass
     mail_provider_override = ""
@@ -3225,7 +3947,58 @@ def _parse_retry_oauth_args(argv):
         j = argv.index("--mail-provider")
         if j + 1 < len(argv):
             mail_provider_override = argv[j + 1].strip()
-    return input_file, max_workers, mail_provider_override
+    return input_file, max_workers, mail_provider_override, workers_explicit
+
+
+def _parse_auth_from_code_args(argv):
+    if "--auth-from-code" not in argv:
+        return None
+
+    args = {
+        "raw_input": "",
+        "code_verifier": "",
+        "email": "",
+        "account_name": "",
+        "upload_cpa": None,
+        "write_token_lines": None,
+    }
+    i = argv.index("--auth-from-code")
+    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+        args["raw_input"] = argv[i + 1].strip()
+
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--code-verifier" and i + 1 < len(argv):
+            args["code_verifier"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if token == "--email" and i + 1 < len(argv):
+            args["email"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if token == "--account-name" and i + 1 < len(argv):
+            args["account_name"] = argv[i + 1].strip()
+            i += 2
+            continue
+        if token == "--upload-cpa":
+            args["upload_cpa"] = True
+            i += 1
+            continue
+        if token == "--no-upload-cpa":
+            args["upload_cpa"] = False
+            i += 1
+            continue
+        if token == "--write-ak-rk":
+            args["write_token_lines"] = True
+            i += 1
+            continue
+        if token == "--no-write-ak-rk":
+            args["write_token_lines"] = False
+            i += 1
+            continue
+        i += 1
+    return args
 
 
 def _parse_main_args(argv):
@@ -3279,184 +4052,300 @@ def _parse_main_args(argv):
     return args
 
 
-def main():
-    global _force_no_tui, _force_tui
-    main_args = _parse_main_args(sys.argv[1:])
-    if main_args["force_no_tui"]:
-        _force_no_tui = True
-        os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
-    if main_args["force_tui"]:
-        _force_tui = True
-        _force_no_tui = False
-        os.environ.pop("CHATGPT_REGISTER_NO_TUI", None)
-    # CLI: 仅补救 OAuth (跳过整个注册菜单)
-    retry_args = _parse_retry_oauth_args(sys.argv[1:])
-    if retry_args is not None:
-        input_file, max_workers, mp_override = retry_args
-        # 代理: 直接用 config / 环境变量, 不交互问
-        proxy = DEFAULT_PROXY or os.environ.get("HTTPS_PROXY") \
-            or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY") \
-            or os.environ.get("all_proxy") or None
-        if proxy:
-            _console_log(f"[Retry] 使用代理: {proxy}")
-        else:
-            _console_log("[Retry] 不使用代理")
-        retry_oauth_only(
-            input_file=input_file,
-            output_file=DEFAULT_OUTPUT_FILE,
-            proxy=proxy,
-            max_workers=max_workers,
-            mail_provider_override=mp_override,
-        )
-        return
-
-    _console_block([
-        "=" * 60,
-        "  ChatGPT 批量自动注册工具 (DuckMail 临时邮箱版)",
-        "=" * 60,
-    ])
-
+def _run_auth_from_code_flow(auth_args, proxy=None):
     interactive = _is_interactive()
 
-    skip_solver_check = _as_bool(os.environ.get("SKIP_SOLVER_CHECK"))
-    if not skip_solver_check:
-        ok, info = _check_sentinel_solver_health()
-        if ok:
-            mode = "in-process" if SENTINEL_INPROCESS else (SENTINEL_SOLVER_URL or "http")
-            _console_log(f"[Sentinel] solver 健康检查通过: {mode} {info}")
-        else:
-            _console_log(f"[Sentinel] ⚠️ solver 不可用: {info}", level="error")
-            if SENTINEL_INPROCESS:
-                _console_log("           当前已配置为同进程模式，请检查 patchright/quart 依赖与浏览器可执行文件", level="warn")
-            else:
-                _console_log("           请先启动: python3 sentinel_solver.py --thread 2", level="warn")
-            _console_log("           或设置 SKIP_SOLVER_CHECK=1 强制跳过", level="warn")
-            sys.exit(2)
+    raw_input = (auth_args.get("raw_input") or "").strip()
+    if not raw_input and interactive:
+        raw_input = _prompt_text("请输入 localhost 回调地址或 authorization code").strip()
+    code = _extract_code_from_input(raw_input)
+    if not code:
+        _console_log("[AuthFile] 未解析到 authorization code", level="error")
+        return 2
 
-    # 邮箱来源选择
-    custom_email = (main_args["email"] or "").strip() or None
-    mail_provider = (main_args["mail_provider"] or "").strip() or "duckmail"
-    if custom_email:
-        mail_provider = "custom"
-    if not custom_email and mail_provider == "custom":
-        if not interactive:
-            _console_log("[Error] --mail-provider custom 需要同时提供 --email", level="error")
-            sys.exit(2)
-        while True:
-            custom_email = input("请输入邮箱地址: ").strip()
-            if "@" in custom_email and "." in custom_email.split("@")[-1]:
-                break
-            _console_log("  邮箱格式无效，请重新输入", level="warn")
-    if not custom_email and main_args["mail_provider"] is None and interactive:
-        catchall_hint = ""
-        if HAS_DOMAIN_CATCHALL:
-            catchall_hint = f"  [3] 自有域名 catch-all → QQ (*@{MAIL_DOMAIN})"
-        choice = input(
-            "\n邮箱来源: [1] DuckMail 临时邮箱(默认)  [2] 指定自有邮箱"
-            f"{catchall_hint}  (或直接粘邮箱): "
-        ).strip()
-        # 直接粘了邮箱 → 等价于选 2
-        if "@" in choice and "." in choice.split("@")[-1]:
-            custom_email = choice
+    code_verifier = (auth_args.get("code_verifier") or "").strip()
+    if not code_verifier and interactive:
+        _console_block([
+            "[AuthFile] 当前是 PKCE 流程，仅有 callback URL 还不够。",
+            "[AuthFile] 还需要与这次登录匹配的 code_verifier 才能换 token。",
+        ], level="warn")
+        code_verifier = _prompt_text("请输入 code_verifier").strip()
+    if not code_verifier:
+        _console_log("[AuthFile] 缺少 code_verifier，无法继续", level="error")
+        return 2
+
+    account_name = (auth_args.get("account_name") or "").strip()
+    email_override = (auth_args.get("email") or "").strip()
+    if interactive and not account_name:
+        account_name = _prompt_text("账号名/文件名（留空则默认用 token 里的邮箱）").strip()
+
+    tokens = _exchange_codex_auth_code(code, code_verifier, proxy=proxy)
+    if not tokens:
+        _console_log("[AuthFile] 根据 code 换 token 失败", level="error")
+        return 1
+
+    inferred_email = _infer_email_from_tokens(tokens)
+    email = email_override or inferred_email
+    if interactive and not email_override:
+        prompt = f"认证文件 email 字段（默认 {inferred_email or '从 token 未解析到，请手填'}）"
+        email_input = _prompt_text(prompt, inferred_email or "").strip()
+        email = email_input or inferred_email
+    if not email:
+        _console_log("[AuthFile] 无法从 token 解析 email，且未手动提供 --email", level="error")
+        return 2
+
+    token_data = _build_codex_token_data(email, tokens)
+    if not token_data:
+        _console_log("[AuthFile] token 数据不完整，未生成认证文件", level="error")
+        return 1
+
+    filename_hint = account_name or email
+    _console_block([
+        f"[AuthFile] 文件名: {_make_auth_filename(filename_hint, fallback_stem=email)}",
+        f"[AuthFile] email: {token_data.get('email')}",
+        f"[AuthFile] account_id: {token_data.get('account_id') or '-'}",
+        f"[AuthFile] expired: {token_data.get('expired') or '-'}",
+        f"[AuthFile] refresh_token: {'有' if token_data.get('refresh_token') else '无'}",
+        f"[AuthFile] id_token: {'有' if token_data.get('id_token') else '无'}",
+    ])
+    if interactive and not _prompt_confirm("确认按以上信息生成认证文件?", default=True):
+        _console_log("[AuthFile] 已取消写入", level="warn")
+        return 0
+
+    write_token_lines = auth_args.get("write_token_lines")
+    if write_token_lines is None:
+        if interactive:
+            write_token_lines = _prompt_confirm("同步写入 ak.txt / rk.txt ?", default=True)
+        else:
+            write_token_lines = True
+
+    upload_cpa = auth_args.get("upload_cpa")
+    upload_ready = bool(UPLOAD_API_URL and UPLOAD_API_TOKEN)
+    if upload_cpa is None:
+        if interactive:
+            upload_cpa = _prompt_confirm("上传到 CPA ?", default=upload_ready)
+        else:
+            upload_cpa = upload_ready
+    if upload_cpa and not upload_ready:
+        _console_log("[AuthFile] upload_api_url 或 upload_api_token 未配置，跳过 CPA 上传", level="warn")
+        upload_cpa = False
+
+    token_path = _persist_codex_token_data(
+        token_data,
+        filename_hint=filename_hint,
+        write_token_lines=write_token_lines,
+        upload_to_cpa=upload_cpa,
+    )
+    _console_log(f"[AuthFile] 认证文件已生成: {token_path}", level="success")
+    return 0
+
+
+def main():
+    global _force_no_tui, _force_tui
+    try:
+        main_args = _parse_main_args(sys.argv[1:])
+        if main_args["force_no_tui"]:
+            _force_no_tui = True
+            os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
+        if main_args["force_tui"]:
+            _force_tui = True
+            _force_no_tui = False
+            os.environ.pop("CHATGPT_REGISTER_NO_TUI", None)
+        auth_args = _parse_auth_from_code_args(sys.argv[1:])
+        if auth_args is not None:
+            proxy = main_args["proxy"] if main_args["proxy"] is not None else DEFAULT_PROXY
+            env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+                or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+            if not proxy and env_proxy:
+                proxy = env_proxy
+            if proxy:
+                _console_log(f"[AuthFile] 使用代理: {proxy}")
+            else:
+                _console_log("[AuthFile] 不使用代理")
+            sys.exit(_run_auth_from_code_flow(auth_args, proxy=proxy))
+        # CLI: 仅补救 OAuth (跳过整个注册菜单)
+        retry_args = _parse_retry_oauth_args(sys.argv[1:])
+        if retry_args is not None:
+            input_file, max_workers, mp_override, workers_explicit = retry_args
+            if _is_interactive() and not workers_explicit:
+                workers_input = _prompt_text("OAuth 补救并发数", str(RETRY_OAUTH_DEFAULT_WORKERS)).strip()
+                if workers_input.isdigit() and int(workers_input) > 0:
+                    max_workers = int(workers_input)
+                else:
+                    max_workers = RETRY_OAUTH_DEFAULT_WORKERS
+            # 代理: 直接用 config / 环境变量, 不交互问
+            proxy = DEFAULT_PROXY or os.environ.get("HTTPS_PROXY") \
+                or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY") \
+                or os.environ.get("all_proxy") or None
+            if proxy:
+                _console_log(f"[Retry] 使用代理: {proxy}")
+            else:
+                _console_log("[Retry] 不使用代理")
+            retry_oauth_only(
+                input_file=input_file,
+                output_file=DEFAULT_OUTPUT_FILE,
+                proxy=proxy,
+                max_workers=max_workers,
+                mail_provider_override=mp_override,
+            )
+            return
+
+        _console_block([
+            "=" * 60,
+            "  ChatGPT 批量自动注册工具",
+            "=" * 60,
+        ])
+
+        interactive = _is_interactive()
+        if interactive and questionary is None:
+            _console_log(
+                f"[Warn] questionary 不可用，当前回退到基础 input 交互: {_QUESTIONARY_IMPORT_ERROR}",
+                level="warn",
+            )
+
+        skip_solver_check = _as_bool(os.environ.get("SKIP_SOLVER_CHECK"))
+        if not skip_solver_check:
+            ok, info = _check_sentinel_solver_health()
+            if ok:
+                mode = "in-process" if SENTINEL_INPROCESS else (SENTINEL_SOLVER_URL or "http")
+                _console_log(f"[Sentinel] solver 健康检查通过: {mode} {info}")
+            else:
+                _console_log(f"[Sentinel] ⚠️ solver 不可用: {info}", level="error")
+                if SENTINEL_INPROCESS:
+                    _console_log("           当前已配置为同进程模式，请检查 patchright/quart 依赖与浏览器可执行文件", level="warn")
+                else:
+                    _console_log("           请先启动: python3 sentinel_solver.py --thread 2", level="warn")
+                _console_log("           或设置 SKIP_SOLVER_CHECK=1 强制跳过", level="warn")
+                sys.exit(2)
+
+        # 邮箱来源选择
+        custom_email = (main_args["email"] or "").strip() or None
+        mail_provider = _normalize_mail_provider((main_args["mail_provider"] or "").strip() or "duckmail")
+        if custom_email:
             mail_provider = "custom"
-        elif choice == "2":
-            mail_provider = "custom"
+        if not custom_email and mail_provider == "custom":
+            if not interactive:
+                _console_log("[Error] --mail-provider custom 需要同时提供 --email", level="error")
+                sys.exit(2)
             while True:
-                custom_email = input("请输入邮箱地址: ").strip()
+                custom_email = _prompt_text("请输入邮箱地址").strip()
                 if "@" in custom_email and "." in custom_email.split("@")[-1]:
                     break
                 _console_log("  邮箱格式无效，请重新输入", level="warn")
-        elif choice == "3":
-            if not HAS_DOMAIN_CATCHALL:
-                _console_log("[Error] 未在 config.json 配置 qq_imap_user/authcode/mail_domain, 回退到 DuckMail", level="error")
-            else:
-                mail_provider = "domain_catchall"
-        if custom_email:
+        if not custom_email and main_args["mail_provider"] is None and interactive:
+            choices = [
+                {"title": "DuckMail 临时邮箱", "value": "duckmail"},
+                {"title": "指定单个邮箱（OTP 手动输入）", "value": "custom"},
+            ]
+            for source in EMAIL_SOURCES:
+                choices.append({
+                    "title": f"{source['name']} | {_describe_email_source(source)}",
+                    "value": _source_provider_key(source["key"]),
+                })
+            default_choice = _source_provider_key(DEFAULT_EMAIL_SOURCE_KEY) if DEFAULT_EMAIL_SOURCE_KEY else "duckmail"
+            choice = _prompt_select("选择注册邮箱来源", choices, default=default_choice)
+            if choice == "custom":
+                mail_provider = "custom"
+                while True:
+                    custom_email = _prompt_text("请输入邮箱地址").strip()
+                    if "@" in custom_email and "." in custom_email.split("@")[-1]:
+                        break
+                    _console_log("  邮箱格式无效，请重新输入", level="warn")
+            elif choice:
+                mail_provider = _normalize_mail_provider(choice)
+            if custom_email:
+                _console_log(f"[Info] 将使用指定邮箱: {custom_email}（OTP 需手动输入，仅注册 1 个账号）")
+            elif _mail_provider_is_imap(mail_provider):
+                source = _get_email_source_for_provider(mail_provider)
+                if source:
+                    _console_log(f"[Info] 将使用: {source['name']} | {_describe_email_source(source)}")
+        elif custom_email:
             _console_log(f"[Info] 将使用指定邮箱: {custom_email}（OTP 需手动输入，仅注册 1 个账号）")
-        elif mail_provider == "domain_catchall":
-            _console_log(f"[Info] 将使用 catch-all 域名: *@{MAIL_DOMAIN} → {QQ_IMAP_USER}")
-    elif custom_email:
-        _console_log(f"[Info] 将使用指定邮箱: {custom_email}（OTP 需手动输入，仅注册 1 个账号）")
-    elif mail_provider == "domain_catchall":
-        if not HAS_DOMAIN_CATCHALL:
-            _console_log("[Error] 未在 config.json 配置 qq_imap_user/authcode/mail_domain", level="error")
-            sys.exit(2)
-        _console_log(f"[Info] 将使用 catch-all 域名: *@{MAIL_DOMAIN} → {QQ_IMAP_USER}")
+        elif _mail_provider_is_imap(mail_provider):
+            source = _get_email_source_for_provider(mail_provider)
+            profile = _get_receiver_profile_for_source(source)
+            if not source or not profile:
+                _console_log("[Error] 所选邮箱来源不存在或未配置完整", level="error")
+                sys.exit(2)
+            _console_log(f"[Info] 将使用: {source['name']} | {_describe_email_source(source)}")
 
-    # 检查 DuckMail 配置（仅在 DuckMail 模式下需要）
-    if mail_provider == "duckmail" and not DUCKMAIL_BEARER:
-        _console_block([
-            "\n⚠️  警告: 未设置 DUCKMAIL_BEARER",
-            "   请编辑 config.json 设置 duckmail_bearer，或设置环境变量:",
-            "   Windows: set DUCKMAIL_BEARER=your_api_key_here",
-            "   Linux/Mac: export DUCKMAIL_BEARER='your_api_key_here'",
-        ], level="warn")
-        if interactive:
-            _console_log("\n   按 Enter 继续尝试运行 (可能会失败)...", level="warn")
-            input()
-        else:
-            _console_log("   当前为非交互环境，继续按默认配置执行。", level="warn")
-
-    # 交互式代理配置
-    proxy = main_args["proxy"] if main_args["proxy"] is not None else DEFAULT_PROXY
-    env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
-             or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-    if main_args["proxy"] is None and interactive:
-        if proxy:
-            _console_log(f"[Info] 检测到默认代理: {proxy}")
-            use_default = input("使用此代理? (Y/n): ").strip().lower()
-            if use_default == "n":
-                proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
-        elif env_proxy:
-            _console_log(f"[Info] 检测到环境变量代理: {env_proxy}")
-            use_env = input("使用此代理? (Y/n): ").strip().lower()
-            if use_env == "n":
-                proxy = input("输入代理地址 (留空=不使用代理): ").strip() or None
+        # 检查 DuckMail 配置（仅在 DuckMail 模式下需要）
+        if mail_provider == "duckmail" and not DUCKMAIL_BEARER:
+            _console_block([
+                "\n⚠️  警告: 未设置 DUCKMAIL_BEARER",
+                "   请编辑 config.json 设置 duckmail_bearer，或设置环境变量:",
+                "   Windows: set DUCKMAIL_BEARER=your_api_key_here",
+                "   Linux/Mac: export DUCKMAIL_BEARER='your_api_key_here'",
+            ], level="warn")
+            if interactive:
+                _prompt_text("按 Enter 继续尝试运行", "")
             else:
+                _console_log("   当前为非交互环境，继续按默认配置执行。", level="warn")
+
+        # 交互式代理配置
+        proxy = main_args["proxy"] if main_args["proxy"] is not None else DEFAULT_PROXY
+        env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+                 or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+        if main_args["proxy"] is None and interactive:
+            if proxy:
+                _console_log(f"[Info] 检测到默认代理: {proxy}")
+                if not _prompt_confirm("使用此代理?", default=True):
+                    proxy = _prompt_text("输入代理地址 (留空=不使用代理)").strip() or None
+            elif env_proxy:
+                _console_log(f"[Info] 检测到环境变量代理: {env_proxy}")
+                if not _prompt_confirm("使用此代理?", default=True):
+                    proxy = _prompt_text("输入代理地址 (留空=不使用代理)").strip() or None
+                else:
+                    proxy = env_proxy
+            else:
+                proxy = _prompt_text("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理)").strip() or None
+        else:
+            if proxy:
+                _console_log(f"[Info] 非交互环境，使用 config.json 中的代理: {proxy}")
+            elif env_proxy:
                 proxy = env_proxy
-        else:
-            proxy = input("输入代理地址 (如 http://127.0.0.1:7890，留空=不使用代理): ").strip() or None
-    else:
+                _console_log(f"[Info] 非交互环境，使用环境变量代理: {proxy}")
+            else:
+                proxy = None
+                _console_log("[Info] 非交互环境，未检测到代理配置", level="warn")
+
         if proxy:
-            _console_log(f"[Info] 非交互环境，使用 config.json 中的代理: {proxy}")
-        elif env_proxy:
-            proxy = env_proxy
-            _console_log(f"[Info] 非交互环境，使用环境变量代理: {proxy}")
+            _console_log(f"[Info] 使用代理: {proxy}")
         else:
-            proxy = None
-            _console_log("[Info] 非交互环境，未检测到代理配置", level="warn")
+            _console_log("[Info] 不使用代理", level="warn")
 
-    if proxy:
-        _console_log(f"[Info] 使用代理: {proxy}")
-    else:
-        _console_log("[Info] 不使用代理", level="warn")
+        # 输入注册数量（指定邮箱模式跳过，只注册 1 个）
+        source = _get_email_source_for_provider(mail_provider)
+        single_address_mode = _email_source_requires_single_address(source)
+        if custom_email or single_address_mode:
+            total_accounts = 1
+            max_workers = 1
+        elif main_args["count"] is not None or main_args["workers"] is not None:
+            total_accounts = main_args["count"] or DEFAULT_TOTAL_ACCOUNTS
+            max_workers = main_args["workers"] or DEFAULT_MAX_WORKERS
+        elif interactive:
+            count_input = _prompt_text("注册账号数量", str(DEFAULT_TOTAL_ACCOUNTS)).strip()
+            total_accounts = int(count_input) if count_input.isdigit() and int(count_input) > 0 else DEFAULT_TOTAL_ACCOUNTS
 
-    # 输入注册数量（指定邮箱模式跳过，只注册 1 个）
-    if custom_email:
-        total_accounts = 1
-        max_workers = 1
-    elif main_args["count"] is not None or main_args["workers"] is not None:
-        total_accounts = main_args["count"] or DEFAULT_TOTAL_ACCOUNTS
-        max_workers = main_args["workers"] or DEFAULT_MAX_WORKERS
-    elif interactive:
-        count_input = input(f"\n注册账号数量 (默认 {DEFAULT_TOTAL_ACCOUNTS}): ").strip()
-        total_accounts = int(count_input) if count_input.isdigit() and int(count_input) > 0 else DEFAULT_TOTAL_ACCOUNTS
+            workers_input = _prompt_text("并发数", str(DEFAULT_MAX_WORKERS)).strip()
+            max_workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else DEFAULT_MAX_WORKERS
+        else:
+            total_accounts = DEFAULT_TOTAL_ACCOUNTS
+            max_workers = DEFAULT_MAX_WORKERS
+            _console_log(f"[Info] 非交互环境，注册数量: {total_accounts}")
+            _console_log(f"[Info] 非交互环境，并发数: {max_workers}")
 
-        workers_input = input(f"并发数 (默认 {DEFAULT_MAX_WORKERS}): ").strip()
-        max_workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else DEFAULT_MAX_WORKERS
-    else:
-        total_accounts = DEFAULT_TOTAL_ACCOUNTS
-        max_workers = DEFAULT_MAX_WORKERS
-        _console_log(f"[Info] 非交互环境，注册数量: {total_accounts}")
-        _console_log(f"[Info] 非交互环境，并发数: {max_workers}")
+        if total_accounts <= 1 and not _force_tui:
+            _force_no_tui = True
+            os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
 
-    if total_accounts <= 1 and not _force_tui:
-        _force_no_tui = True
-        os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
-
-    run_batch(total_accounts=total_accounts, output_file=DEFAULT_OUTPUT_FILE,
-              max_workers=max_workers, proxy=proxy, custom_email=custom_email,
-              mail_provider=mail_provider)
+        run_batch(total_accounts=total_accounts, output_file=DEFAULT_OUTPUT_FILE,
+                  max_workers=max_workers, proxy=proxy, custom_email=custom_email,
+                  mail_provider=mail_provider)
+    except KeyboardInterrupt:
+        _shutdown_event.set()
+        _console_log("\n[Cancel] Interrupted by user.", level="warn")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

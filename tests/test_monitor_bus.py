@@ -4,7 +4,7 @@ import io
 import unittest
 
 from monitor import bus
-from monitor.fallback import TextSubscriber
+from monitor.fallback import MemoryBufferSubscriber, TextSubscriber
 
 
 class MonitorBusTests(unittest.TestCase):
@@ -54,6 +54,35 @@ class MonitorBusTests(unittest.TestCase):
             subscriber.drain_once(limit=None)
             line = stream.getvalue().strip()
             self.assertIn("[WARN][worker][W2] hello", line)
+        finally:
+            subscriber.stop(drain=False)
+
+    def test_memory_buffer_keeps_recent_lines(self):
+        subscriber = MemoryBufferSubscriber(capacity=2)
+        try:
+            bus.emit("worker", "one")
+            bus.emit("worker", "two")
+            bus.emit("worker", "three")
+            subscriber.drain_once(limit=None)
+            lines, discarded = subscriber.snapshot()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(discarded, 1)
+            self.assertIn("two", lines[0])
+            self.assertIn("three", lines[1])
+        finally:
+            subscriber.stop(drain=False)
+
+    def test_memory_buffer_replay(self):
+        stream = io.StringIO()
+        subscriber = MemoryBufferSubscriber(capacity=2)
+        try:
+            bus.emit("system", "hello", level="warn")
+            subscriber.drain_once(limit=None)
+            replayed = subscriber.replay(stream=stream)
+            self.assertEqual(replayed, 1)
+            output = stream.getvalue()
+            self.assertIn("=== Recent Logs ===", output)
+            self.assertIn("[WARN][system] hello", output)
         finally:
             subscriber.stop(drain=False)
 

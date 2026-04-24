@@ -290,6 +290,13 @@ class SentinelSolver:
             page.on("console", lambda m: logger.debug(f"[{req_id}] console {m.type}: {m.text[:200]}"))
             page.on("pageerror", lambda e: logger.debug(f"[{req_id}] pageerror: {str(e)[:200]}"))
 
+            def _on_request_failed(request):
+                logger.debug(
+                    f"[{req_id}] requestfailed: {request.method} {request.resource_type} "
+                    f"{request.url} err={request.failure or 'unknown'}"
+                )
+            page.on("requestfailed", _on_request_failed)
+
             sdk_re = _re.compile(r"https://sentinel\.openai\.com/sentinel/[^/]+/sdk\.js")
             def _on_resp(resp):
                 if sdk_re.search(resp.url) and resp.url not in sdk_seen:

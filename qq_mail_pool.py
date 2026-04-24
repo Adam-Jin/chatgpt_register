@@ -1,5 +1,5 @@
 """
-自有域名 catch-all 邮箱池 (QQ 邮箱收信)
+自有域名 catch-all 邮箱池 (IMAP 邮箱收信)
 
 适用场景:
     自有域名通过 Cloudflare Email Routing (catch-all) 把 *@yourdomain.com
@@ -14,10 +14,11 @@ Cloudflare Email Routing 行为说明:
     - Cloudflare 会附加 X-Forwarded-To 表示真实投递地址 (QQ)
     - From / Subject / 正文保持原样, 编码也不动
 
-QQ IMAP:
-    - imap.qq.com:993 SSL
-    - 用户名 = 完整 QQ 邮箱
-    - 密码 = QQ 邮箱设置里生成的"授权码", 不是 QQ 登录密码
+IMAP:
+    - 默认 imap.qq.com:993 SSL
+    - 也支持其它标准 IMAP SSL 邮箱服务器
+    - 用户名通常为完整邮箱地址
+    - 密码可以是邮箱密码, 也可以是服务商要求的授权码
 """
 
 import base64
@@ -33,6 +34,10 @@ import ssl
 from typing import Callable, Optional
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
+
+
+class _IdleUnsupportedError(RuntimeError):
+    """IMAP server does not support IDLE and should fall back to polling."""
 
 
 def _imap_utf7_encode(name: str) -> bytes:
@@ -150,6 +155,7 @@ def extract_otp(content: str):
 class QQMailPool:
     def __init__(self, host, port, user, authcode, domain,
                  poll_interval=4, debug=False, folder="INBOX",
+                 security="auto",
                  log: Optional[Callable[[str], None]] = None):
         self.host = host
         self.port = int(port)
@@ -159,6 +165,7 @@ class QQMailPool:
         self.poll_interval = max(1, int(poll_interval))
         self.debug = bool(debug)
         self.folder = folder or "INBOX"
+        self.security = str(security or "auto").strip().lower() or "auto"
         self.log = log
 
         # 收件箱: address(lower) -> [{uid, ts, subject, from, body}, ...] (新→旧)
@@ -168,11 +175,16 @@ class QQMailPool:
         self._used_locals = set()
         self._used_lock = threading.Lock()
 
+        # 仅对注册地址打 INFO 收件日志, 避免无关 worker 的邮件污染日志通道
+        self._watched_addresses = set()
+        self._watched_lock = threading.Lock()
+
         self._last_uid = 0
         self._stop = threading.Event()
         self._thread = None
         self._started = False
         self._ready = threading.Event()
+        self._idle_supported = None
 
     # ---- 生命周期 ----
 
@@ -192,16 +204,71 @@ class QQMailPool:
 
     # ---- IMAP 主循环 ----
 
-    def _connect(self):
-        ctx = ssl.create_default_context()
-        imap = imaplib.IMAP4_SSL(self.host, self.port, ssl_context=ctx)
-        imap.login(self.user, self.authcode)
-        # QQ IMAP 登录后建议发送 ID 命令以避免被限流
+    def _cleanup_imap(self, imap):
+        if not imap:
+            return
         try:
-            imap.xatom("ID", '("name" "QQMailPool" "version" "1.0")')
+            imap.shutdown()
+            return
         except Exception:
             pass
+        try:
+            if getattr(imap, "sock", None):
+                imap.sock.close()
+        except Exception:
+            pass
+
+    def _open_imap(self):
+        ctx = ssl.create_default_context()
+        if self.security == "ssl" or (self.security == "auto" and int(self.port) == 993):
+            return imaplib.IMAP4_SSL(self.host, self.port, ssl_context=ctx)
+        imap = imaplib.IMAP4(self.host, self.port)
+        if self.security in {"starttls", "auto"}:
+            try:
+                imap.starttls(ssl_context=ctx)
+            except Exception:
+                self._cleanup_imap(imap)
+                raise
         return imap
+
+    def _connect(self):
+        imap = None
+        try:
+            imap = self._open_imap()
+            imap.login(self.user, self.authcode)
+            # QQ IMAP 登录后建议发送 ID 命令以避免被限流
+            try:
+                imap.xatom("ID", '("name" "QQMailPool" "version" "1.0")')
+            except Exception:
+                pass
+            if self._idle_supported is not False:
+                self._idle_supported = self._detect_idle_support(imap)
+            return imap
+        except Exception:
+            self._cleanup_imap(imap)
+            raise
+
+    def _detect_idle_support(self, imap):
+        try:
+            typ, data = imap.capability()
+        except Exception:
+            return None
+        if typ != "OK" or not data:
+            return None
+        caps = []
+        for item in data:
+            if isinstance(item, bytes):
+                caps.append(item.upper())
+            else:
+                caps.append(str(item).encode("utf-8", errors="ignore").upper())
+        merged = b" ".join(caps)
+        supported = b"IDLE" in merged.split()
+        if self.debug:
+            self._log(
+                f"CAPABILITY {'支持' if supported else '不支持'} IDLE: "
+                f"{merged.decode('utf-8', errors='replace')[:200]}"
+            )
+        return supported
 
     def _select_folder(self, imap):
         """SELECT 配置的文件夹, 自动用 modified UTF-7 编码非 ASCII 名"""
@@ -245,8 +312,20 @@ class QQMailPool:
                 while not self._stop.is_set():
                     # 1. 先把当前还没拉的新邮件抓完
                     self._poll_once(imap)
-                    # 2. IDLE 长连接等推送, 有新邮件 (EXISTS) 立刻醒
-                    self._idle_wait(imap, self.IDLE_MAX_SECONDS)
+                    # 2. IDLE 长连接等推送; 若服务端不支持则回退到普通轮询
+                    if self._idle_supported is False:
+                        if self._stop.wait(self.poll_interval):
+                            break
+                        continue
+                    try:
+                        self._idle_wait(imap, self.IDLE_MAX_SECONDS)
+                        if self._idle_supported is None:
+                            self._idle_supported = True
+                    except _IdleUnsupportedError:
+                        self._idle_supported = False
+                        self._log(f"IDLE 不支持, 回退到每 {self.poll_interval}s 轮询")
+                        if self._stop.wait(self.poll_interval):
+                            break
                     # 醒来后回到 1. 再 poll 一遍即可拿到新 UID
                 try:
                     imap.logout()
@@ -274,6 +353,9 @@ class QQMailPool:
         except Exception as e:
             raise imaplib.IMAP4.abort(f"IDLE 等待 + 失败: {e}")
         if not resp.startswith(b"+"):
+            low = resp.lower()
+            if b"idle" in low and (b"not recognized" in low or b"unsupported" in low):
+                raise _IdleUnsupportedError(resp.decode("utf-8", errors="replace"))
             self._log(f"IDLE 被拒: {resp!r}")
             return
 
@@ -389,8 +471,10 @@ class QQMailPool:
 
     def _ingest(self, uid, msg):
         recipient = self._extract_recipient(msg)
-        if self.debug:
-            # 把所有候选 header 打出来便于排查
+        recipient_lc = recipient.lower() if recipient else None
+        with self._watched_lock:
+            is_watched = recipient_lc in self._watched_addresses if recipient_lc else False
+        if self.debug and (is_watched or not recipient_lc):
             hdrs = {}
             for h in ("To", "From", "Subject", "Delivered-To",
                       "X-Original-To", "X-Forwarded-To"):
@@ -401,11 +485,10 @@ class QQMailPool:
         if not recipient:
             self._log(f"UID={uid} 无法解析原始收件人, 丢弃")
             return
-        recipient = recipient.lower()
+        recipient = recipient_lc
         subject = self._decode_header(msg.get("Subject", ""))
         sender = self._decode_header(msg.get("From", ""))
         body = self._extract_body(msg)
-        # 用 ingest 本地时刻而非 Date header, 避免时钟差/CF 延迟导致 since_ts 误过滤
         ts = time.time()
         item = {
             "uid": uid, "ts": ts, "subject": subject,
@@ -416,10 +499,11 @@ class QQMailPool:
             lst.insert(0, item)
             if len(lst) > 20:
                 del lst[20:]
-        self._log(
-            f"收件 UID={uid} → {recipient} | from={sender[:40]} | "
-            f"subj={subject[:40]}"
-        )
+        if is_watched or self.debug:
+            self._log(
+                f"收件 UID={uid} → {recipient} | from={sender[:40]} | "
+                f"subj={subject[:40]}"
+            )
 
     def _extract_recipient(self, msg):
         """从邮件 header 找出原始收件人 (Cloudflare 保留 To:)"""
@@ -499,11 +583,33 @@ class QQMailPool:
 
     # ---- 对外 API ----
 
-    def acquire_email(self, domain=None):
+    def register_address(self, address):
+        """声明 worker 关注的收件地址 → 该地址的接收事件会以 INFO 打印"""
+        if not address:
+            return
+        with self._watched_lock:
+            self._watched_addresses.add(address.lower())
+
+    def unregister_address(self, address):
+        if not address:
+            return
+        with self._watched_lock:
+            self._watched_addresses.discard(address.lower())
+
+    def acquire_email(self, domain=None, base_address=None):
         domain = (domain or self.domain).lower().lstrip("@")
+        prefix_local = ""
+        if base_address:
+            parsed = self._parse_email_addr(base_address) or str(base_address).strip()
+            if "@" in parsed:
+                prefix_local, parsed_domain = parsed.split("@", 1)
+                prefix_local = prefix_local.strip().lower()
+                parsed_domain = parsed_domain.strip().lower().lstrip("@")
+                if parsed_domain:
+                    domain = parsed_domain
         addr = None
         for _ in range(80):
-            local = self._random_human_local()
+            local = self._build_candidate_local(prefix_local)
             with self._used_lock:
                 if local in self._used_locals:
                     continue
@@ -512,13 +618,14 @@ class QQMailPool:
             break
         if not addr:
             # 极端情况: 加随机后缀
-            local = self._random_human_local() + str(random.randint(100, 9999))
+            local = self._build_candidate_local(prefix_local) + str(random.randint(100, 9999))
             with self._used_lock:
                 self._used_locals.add(local)
             addr = f"{local}@{domain}"
         # 记录该地址 acquire 时刻, 防止抓到 INBOX 里偶然存在的同名旧邮件
         with self._inbox_lock:
             self._inbox.setdefault(addr.lower(), [])
+        self.register_address(addr)
         return addr
 
     def release(self, address):
@@ -526,6 +633,7 @@ class QQMailPool:
             return
         with self._inbox_lock:
             self._inbox.pop(address.lower(), None)
+        self.unregister_address(address)
 
     def get_messages_since(self, address, since_ts=0.0):
         with self._inbox_lock:
@@ -537,6 +645,7 @@ class QQMailPool:
     def wait_for_otp(self, address, timeout=120, since_ts=None,
                      exclude_codes=None, poll_interval=2):
         """阻塞等待 address 的最新 OTP, 失败返回 None"""
+        self.register_address(address)
         deadline = time.time() + timeout
         exclude_codes = set(exclude_codes or [])
         addr_lc = address.lower()
@@ -553,6 +662,19 @@ class QQMailPool:
         return None
 
     # ---- 邮箱名生成 ----
+
+    def _build_candidate_local(self, prefix_local=""):
+        if not prefix_local:
+            return self._random_human_local()
+        return f"{prefix_local}{self._random_suffix_local()}"
+
+    def _random_suffix_local(self):
+        # 2925 这类“一邮多用”场景通常只接受字母/数字/下划线, 这里复用
+        # 现有真人邮箱名生成器, 再把点号等字符收敛成下划线。
+        local = re.sub(r"[^a-z0-9_]+", "_", self._random_human_local().lower()).strip("_")
+        if local:
+            return local
+        return f"user{random.randint(100, 9999)}"
 
     def _random_human_local(self):
         first = random.choice(_FIRST_NAMES)
@@ -588,40 +710,150 @@ class QQMailPool:
                 print(f"[QQMailPool] {msg}")
 
 
-# ---- 单例 ----
+# ---- 池缓存 ----
 
-_pool_instance = None
+_pool_instances = {}
 _pool_init_lock = threading.Lock()
 
 
+def _resolve_cli_imap_config(config, selected_key=""):
+    """兼容新旧配置结构，给 qq_mail_pool.py 独立 CLI 使用。"""
+    legacy = {
+        "qq_imap_host": config.get("qq_imap_host") or config.get("mail_imap_host") or "",
+        "qq_imap_port": int(config.get("qq_imap_port") or config.get("mail_imap_port") or 993),
+        "qq_imap_user": config.get("qq_imap_user") or config.get("mail_imap_user") or "",
+        "qq_imap_authcode": (
+            config.get("qq_imap_authcode")
+            or config.get("mail_imap_authcode")
+            or config.get("mail_imap_password")
+            or ""
+        ),
+        "qq_imap_folder": config.get("qq_imap_folder") or config.get("mail_imap_folder") or "INBOX",
+        "qq_imap_security": config.get("qq_imap_security") or config.get("mail_imap_security") or "auto",
+        "mail_domain": config.get("mail_domain") or "",
+    }
+    if legacy["qq_imap_host"] and legacy["qq_imap_user"] and legacy["qq_imap_authcode"]:
+        return legacy
+
+    profiles = config.get("imap_profiles") or []
+    profiles_by_key = {
+        str(item.get("key") or item.get("id") or "").strip(): item
+        for item in profiles if isinstance(item, dict)
+    }
+    email_sources = config.get("email_sources") or []
+    default_source_key = str(config.get("default_email_source") or "").strip()
+    source = None
+    requested_key = str(selected_key or "").strip()
+    if requested_key:
+        for item in email_sources:
+            if isinstance(item, dict) and str(item.get("key") or item.get("id") or "").strip() == requested_key:
+                source = item
+                break
+        if not source and requested_key in profiles_by_key:
+            profile = profiles_by_key.get(requested_key)
+            return {
+                "qq_imap_host": str(profile.get("host") or "").strip(),
+                "qq_imap_port": int(profile.get("port") or 993),
+                "qq_imap_user": str(profile.get("user") or "").strip(),
+                "qq_imap_authcode": str(
+                    profile.get("password")
+                    or profile.get("authcode")
+                    or profile.get("imap_password")
+                    or ""
+                ).strip(),
+                "qq_imap_folder": str(profile.get("folder") or "INBOX").strip() or "INBOX",
+                "qq_imap_security": str(
+                    profile.get("security")
+                    or profile.get("imap_security")
+                    or profile.get("ssl_mode")
+                    or "auto"
+                ).strip().lower() or "auto",
+                "mail_domain": "",
+            }
+    if not source and default_source_key:
+        for item in email_sources:
+            if isinstance(item, dict) and str(item.get("key") or item.get("id") or "").strip() == default_source_key:
+                source = item
+                break
+    if not source and email_sources:
+        source = next((item for item in email_sources if isinstance(item, dict)), None)
+
+    profile = None
+    mail_domain = ""
+    if isinstance(source, dict):
+        receiver = str(
+            source.get("receiver")
+            or source.get("receiver_profile")
+            or source.get("imap_profile")
+            or source.get("profile")
+            or ""
+        ).strip()
+        mail_domain = str(source.get("domain") or "").strip().lower().lstrip("@")
+        if receiver:
+            profile = profiles_by_key.get(receiver)
+
+    if not profile and profiles:
+        profile = next((item for item in profiles if isinstance(item, dict)), None)
+
+    if not isinstance(profile, dict):
+        return legacy
+
+    return {
+        "qq_imap_host": str(profile.get("host") or "").strip(),
+        "qq_imap_port": int(profile.get("port") or 993),
+        "qq_imap_user": str(profile.get("user") or "").strip(),
+        "qq_imap_authcode": str(
+            profile.get("password")
+            or profile.get("authcode")
+            or profile.get("imap_password")
+            or ""
+        ).strip(),
+        "qq_imap_folder": str(profile.get("folder") or "INBOX").strip() or "INBOX",
+        "qq_imap_security": str(
+            profile.get("security")
+            or profile.get("imap_security")
+            or profile.get("ssl_mode")
+            or "auto"
+        ).strip().lower() or "auto",
+        "mail_domain": mail_domain,
+    }
+
+
 def get_pool(config=None, log: Optional[Callable[[str], None]] = None):
-    """根据 config 拿到全局唯一池, 第一次调用时创建并启动"""
-    global _pool_instance
-    if _pool_instance is not None:
-        return _pool_instance
+    """根据 config 拿到池实例, 相同连接参数复用同一个池"""
     with _pool_init_lock:
-        if _pool_instance is not None:
-            return _pool_instance
         if not config:
             return None
-        user = config.get("qq_imap_user")
-        authcode = config.get("qq_imap_authcode")
+        user = config.get("mail_imap_user") or config.get("qq_imap_user")
+        authcode = (
+            config.get("mail_imap_password")
+            or config.get("mail_imap_authcode")
+            or config.get("qq_imap_authcode")
+        )
         domain = config.get("mail_domain")
         if not (user and authcode and domain):
             return None
+        host = config.get("mail_imap_host") or config.get("qq_imap_host", "imap.qq.com")
+        port = int(config.get("mail_imap_port") or config.get("qq_imap_port", 993))
+        folder = config.get("mail_imap_folder") or config.get("qq_imap_folder", "INBOX")
+        security = str(config.get("mail_imap_security") or config.get("qq_imap_security") or "auto").strip().lower() or "auto"
+        cache_key = (host, port, user, domain, folder, security)
+        if cache_key in _pool_instances:
+            return _pool_instances[cache_key]
         pool = QQMailPool(
-            host=config.get("qq_imap_host", "imap.qq.com"),
-            port=config.get("qq_imap_port", 993),
+            host=host,
+            port=port,
             user=user,
             authcode=authcode,
             domain=domain,
             poll_interval=config.get("mail_poll_interval", 4),
             debug=bool(config.get("mail_debug", False)),
-            folder=config.get("qq_imap_folder", "INBOX"),
+            folder=folder,
+            security=security,
             log=log,
         )
         pool.start()
-        _pool_instance = pool
+        _pool_instances[cache_key] = pool
         return pool
 
 
@@ -630,14 +862,20 @@ def get_pool(config=None, log: Optional[Callable[[str], None]] = None):
 #   python qq_mail_pool.py inspect     → 打印 INBOX 最新 5 封邮件的 header 详情
 #   python qq_mail_pool.py inspect 10  → 同上, 取最新 10 封
 
-def _cli_inspect(cfg, count=5):
+def _cli_inspect(cfg, count=5, selected_key=""):
     """直接用 IMAP 取 INBOX 最新 N 封邮件, 打印 header 全貌"""
-    import ssl as _ssl
+    cfg = _resolve_cli_imap_config(cfg, selected_key=selected_key)
     print(f"连接 {cfg['qq_imap_host']}:{cfg.get('qq_imap_port', 993)} ...")
-    imap = imaplib.IMAP4_SSL(
-        cfg["qq_imap_host"], int(cfg.get("qq_imap_port", 993)),
-        ssl_context=_ssl.create_default_context(),
+    helper = QQMailPool(
+        host=cfg["qq_imap_host"],
+        port=int(cfg.get("qq_imap_port", 993)),
+        user=cfg["qq_imap_user"],
+        authcode=cfg["qq_imap_authcode"],
+        domain=cfg.get("mail_domain", "") or "example.com",
+        folder=cfg.get("qq_imap_folder", "INBOX"),
+        security=cfg.get("qq_imap_security", "auto"),
     )
+    imap = helper._open_imap()
     imap.login(cfg["qq_imap_user"], cfg["qq_imap_authcode"])
     try:
         imap.xatom("ID", '("name" "QQMailPool" "version" "1.0")')
@@ -727,10 +965,19 @@ if __name__ == "__main__":
         cfg = json.load(f)
 
     if len(_sys.argv) > 1 and _sys.argv[1] == "inspect":
-        n = int(_sys.argv[2]) if len(_sys.argv) > 2 else 5
-        _cli_inspect(cfg, n)
+        selected_key = ""
+        n = 5
+        if len(_sys.argv) > 2:
+            if _sys.argv[2].isdigit():
+                n = int(_sys.argv[2])
+            else:
+                selected_key = _sys.argv[2]
+        if len(_sys.argv) > 3 and _sys.argv[3].isdigit():
+            n = int(_sys.argv[3])
+        _cli_inspect(cfg, n, selected_key=selected_key)
         raise SystemExit(0)
 
+    cfg = _resolve_cli_imap_config(cfg)
     cfg["mail_debug"] = True
     pool = get_pool(cfg)
     if not pool:

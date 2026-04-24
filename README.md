@@ -22,7 +22,7 @@
   - HeroSMS: [herosms_pool.py](/home/dev/repos/public-repos/chatgpt_register/herosms_pool.py)
   - Quackr: [quackr_pool.py](/home/dev/repos/public-repos/chatgpt_register/quackr_pool.py)
 - 支持手机号复用池与租约管理：[phone_pool.py](/home/dev/repos/public-repos/chatgpt_register/phone_pool.py)
-- 支持 QQ IMAP 收信池与 OTP 提取：[qq_mail_pool.py](/home/dev/repos/public-repos/chatgpt_register/qq_mail_pool.py)
+- 支持 IMAP 收信池与 OTP 提取（兼容 QQ 和其它标准 IMAP SSL 邮箱）：[qq_mail_pool.py](/home/dev/repos/public-repos/chatgpt_register/qq_mail_pool.py)
 - 支持本地浏览器辅助服务：[sentinel_solver.py](/home/dev/repos/public-repos/chatgpt_register/sentinel_solver.py)
 - 支持 OAuth 失败后的补跑队列：`pending_oauth.txt`
 - 支持令牌和账号结果输出
@@ -37,7 +37,7 @@ chatgpt_register/
 ├── herosms_pool.py          # HeroSMS provider
 ├── quackr_pool.py           # Quackr provider
 ├── phone_pool.py            # 手机号复用池
-├── qq_mail_pool.py          # QQ IMAP catch-all 收信池
+├── qq_mail_pool.py          # IMAP catch-all 收信池
 ├── browser_configs.py       # 浏览器指纹配置
 ├── config.json              # 运行配置
 ├── data.db                  # 本地池 / 租约 / 状态数据库
@@ -101,13 +101,36 @@ pip install -r requirements_solver.txt
 | `phone_max_reuse` | 单号允许复用次数 |
 | `phone_pool_lease_seconds` | 租约时长 |
 | `phone_pool_heartbeat_seconds` | 续租心跳间隔 |
-| `qq_imap_user` | QQ IMAP 用户名 |
-| `qq_imap_authcode` | QQ 邮箱授权码 |
-| `mail_domain` | catch-all 域名 |
+| `default_email_source` | 默认注册来源，对旧的 `domain_catchall` 兼容入口也会映射到这里 |
+| `email_sources` | 注册来源列表；决定“注册用哪个邮箱地址”以及“OTP 默认走哪个收件箱” |
+| `imap_profiles` | IMAP 收件箱列表；只描述收件箱连接参数，不直接作为注册来源展示 |
+| `mail_imap_host` | IMAP 服务器地址，默认兼容 `qq_imap_host` |
+| `mail_imap_port` | IMAP 端口，默认兼容 `qq_imap_port` |
+| `mail_imap_user` | IMAP 用户名，默认兼容 `qq_imap_user` |
+| `mail_imap_password` | IMAP 密码或授权码，默认兼容 `qq_imap_authcode` |
+| `mail_imap_folder` | 监听的 IMAP 文件夹，默认兼容 `qq_imap_folder` |
+| `qq_imap_user` | 旧版配置键，兼容保留 |
+| `qq_imap_authcode` | 旧版配置键，兼容保留 |
+| `mail_domain` | 旧版 catch-all 域名配置，兼容保留 |
 | `duckmail_api_base` | DuckMail API 地址 |
 | `duckmail_bearer` | DuckMail token |
 | `upload_api_url` | 外部结果上传接口，可选 |
 | `upload_api_token` | 外部结果上传鉴权，可选 |
+
+推荐把邮箱配置拆成两层：
+
+- `imap_profiles`
+  - 只负责“怎么收件”，例如 `QQ`、`2925`、其它 IMAP 收件箱
+- `email_sources`
+  - 只负责“注册时邮箱地址怎么来”
+  - `forward_domain`: 例如 `*@pandalabs.asia -> qq-main`
+  - `imap_mailbox`: 默认直接使用真实邮箱；也可配 `address_mode: suffix_alias`，基于主账号派生类似 `2925` 的子邮箱
+
+交互启动时会展示 `DuckMail / 指定单个邮箱 / email_sources`，不再直接把 IMAP profile 当成“邮箱来源”。
+
+`forward_domain` / `imap_mailbox` 当前都只会 `SELECT` 并监听一个 IMAP 文件夹，也就是对应 profile 的 `folder`（或旧键 `qq_imap_folder` / `mail_imap_folder`）指定的那个文件夹；不会同时扫描垃圾箱、广告邮件、其它文件夹。
+
+命令行仍支持旧的 `--mail-provider domain_catchall`、`--mail-provider imap:<profile_key>` 兼容入口，内部会自动映射到新的 `email_sources`。新的推荐写法是 `--mail-provider source:<source_key>`。
 
 环境变量会覆盖部分 `config.json` 配置，代码中已接入的包括：
 
@@ -152,16 +175,19 @@ SKIP_SOLVER_CHECK=1 python3 chatgpt_register.py
 
 ## 交互模式
 
-主脚本当前支持三种邮箱来源：
+主脚本当前支持四类注册来源：
 
 1. DuckMail 临时邮箱
 2. 指定自有邮箱
-3. 自有域名 catch-all 转发到 QQ
+3. `forward_domain`，例如 `*@pandalabs.asia -> Primary Inbox`
+4. `imap_mailbox`，例如直接使用 `2925` 邮箱本身注册，或启用 `suffix_alias` 后派生 `2925` 子邮箱
 
 其中：
 
 - 指定邮箱模式会强制单账号、单线程运行
-- catch-all 模式依赖 QQ IMAP 配置
+- 固定地址的 `imap_mailbox` 会强制单账号、单线程运行
+- `imap_mailbox + address_mode: suffix_alias` 可以像 `forward_domain` 一样批量生成不同地址
+- `forward_domain` / `imap_mailbox` 都依赖 `imap_profiles + email_sources`
 - DuckMail 模式依赖 `duckmail_bearer`
 
 ## OAuth 补跑
@@ -172,6 +198,8 @@ SKIP_SOLVER_CHECK=1 python3 chatgpt_register.py
 python3 chatgpt_register.py --retry-oauth
 ```
 
+直接执行时默认并发为 `2`。如果是在交互终端里运行且未显式传 `--workers`，程序会先提示一次并发数。
+
 指定文件或并发数：
 
 ```bash
@@ -181,7 +209,7 @@ python3 chatgpt_register.py --retry-oauth pending_oauth.txt --workers 3
 强制补跑时使用某个邮箱来源标记：
 
 ```bash
-python3 chatgpt_register.py --retry-oauth pending_oauth.txt --workers 3 --mail-provider domain_catchall
+python3 chatgpt_register.py --retry-oauth pending_oauth.txt --workers 3 --mail-provider source:pandalabs
 ```
 
 ## 输出产物

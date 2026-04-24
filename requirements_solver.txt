@@ -3,3 +3,4 @@ patchright>=1.48
 rich>=13
 curl_cffi>=0.7
 textual>=0.80
+questionary>=2.0

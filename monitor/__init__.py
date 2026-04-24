@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import sys
+import contextlib
 from typing import Any, Callable, Optional
 
 from . import bus
-from .fallback import TextSubscriber
+from .fallback import MemoryBufferSubscriber, TextSubscriber
 
 
 def get_bus():
@@ -58,6 +59,8 @@ def run_with_monitor(
         finally:
             subscriber.stop()
 
+    app = None
+    replay_buffer = MemoryBufferSubscriber().start()
     try:
         from .app import RegisterMonitorApp
 
@@ -70,14 +73,34 @@ def run_with_monitor(
             intake_paused=intake_paused,
             shutdown_event=shutdown_event,
         )
-        return app.run()
+        result = app.run()
+        _replay_buffer(replay_buffer)
+        return result
+    except KeyboardInterrupt:
+        if shutdown_event is not None:
+            shutdown_event.set()
+        with contextlib.suppress(Exception):
+            app._drain_bus()
+        with contextlib.suppress(Exception):
+            app._restore_stream_capture()
+        with contextlib.suppress(Exception):
+            app._cleanup_bus()
+        _force_restore_terminal(app)
+        _replay_buffer(replay_buffer)
+        raise
     except Exception as exc:
+        _force_restore_terminal(locals().get("app"))
+        with contextlib.suppress(Exception):
+            replay_buffer.stop()
         subscriber = TextSubscriber().start()
         try:
             bus.emit("system", f"TUI init failed, fallback to text: {exc}", level="warn")
             return run_callable()
         finally:
             subscriber.stop()
+    finally:
+        with contextlib.suppress(Exception):
+            replay_buffer.stop()
 
 
 def _stdout_is_tty() -> bool:
@@ -85,3 +108,21 @@ def _stdout_is_tty() -> bool:
         return sys.stdout.isatty()
     except Exception:
         return False
+
+
+def _force_restore_terminal(app=None) -> None:
+    driver = getattr(app, "_driver", None)
+    if driver is not None:
+        with contextlib.suppress(BaseException):
+            driver.stop_application_mode()
+    stream = getattr(sys, "__stdout__", None) or sys.stdout
+    with contextlib.suppress(Exception):
+        stream.write("\x1b[?2004l\x1b[?7h\x1b[<u\x1b[?1049l\x1b[?25h\x1b[?1004l\x1b[0m\r\n")
+        stream.flush()
+
+
+def _replay_buffer(buffer: MemoryBufferSubscriber) -> None:
+    with contextlib.suppress(Exception):
+        buffer.stop()
+    with contextlib.suppress(Exception):
+        buffer.replay()
