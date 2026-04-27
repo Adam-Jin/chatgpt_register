@@ -90,6 +90,23 @@ _print_lock = threading.Lock()
 _file_lock = threading.Lock()
 
 
+APP_BANNER_LINES = [
+    "        .-''''-.",
+    "       /  .--.  \\",
+    "      /  /_  _\\  \\",
+    "      | |(@)(@)| |",
+    "      | |  __  | |",
+    "      \\  \\_==_/  /",
+    "       '._/  \\_.'",
+    "       .--\\__/--.",
+    "      /          \\",
+]
+
+
+class OAuthPendingRequired(RuntimeError):
+    """OAuth 命中可补救分支，应写入 pending_oauth.txt 后续补跑。"""
+
+
 _ANSI_RESET = "\033[0m"
 _ANSI_LEVEL = {
     "debug": "\033[2;37m",
@@ -122,11 +139,19 @@ def _console_block(lines, *, level: str = "info") -> None:
     for line in lines:
         _console_log(line, level=level)
 
+
+def _banner_text() -> str:
+    return "\n".join(APP_BANNER_LINES)
+
+
+def _print_banner(*, level: str = "info") -> None:
+    _console_block(APP_BANNER_LINES, level=level)
+
 # ================= 加载配置 =================
 def _load_config():
     """从 config.json 加载配置，环境变量优先级更高"""
     config = {
-        "total_accounts": 3,
+        "total_accounts": 1,
         "duckmail_api_base": "https://api.duckmail.sbs",
         "duckmail_bearer": "",
         "default_email_source": "",
@@ -143,7 +168,7 @@ def _load_config():
         "oauth_redirect_uri": "http://localhost:1455/auth/callback",
         "ak_file": "ak.txt",
         "rk_file": "rk.txt",
-        "max_workers": 3,
+        "max_workers": 1,
         "tui_enabled": True,
         "log_level": DEFAULT_LOG_LEVEL,
         "token_json_dir": "codex_tokens",
@@ -168,7 +193,7 @@ def _load_config():
         "herosms_country": 52,
         "herosms_service": "dr",
         "herosms_max_price": 0.05,
-        "herosms_fixed_price": True,
+        "herosms_free_price": True,
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -264,23 +289,65 @@ def _prompt_select(message: str, choices, default: Any = None):
         pick = int(raw)
         if 1 <= pick <= len(normalized):
             return normalized[pick - 1]["value"]
+    if not raw and default is None and normalized:
+        return normalized[0]["value"]
     return default
 
 
-def _prompt_text(message: str, default: str = "") -> str:
+def _prompt_text(
+    message: str,
+    default: str = "",
+    *,
+    instruction: str = "",
+    placeholder_default: bool = False,
+) -> str:
     if questionary is not None:
         try:
-            result = questionary.text(message, default=default or "").ask()
+            prompt_default = default or ""
+            extra_kwargs = {}
+            prompt_instruction = instruction or None
+            if placeholder_default and default:
+                prompt_default = ""
+                extra_kwargs["placeholder"] = [("fg:#7a7a7a", str(default))]
+                if not prompt_instruction:
+                    prompt_instruction = "留空使用默认值"
+            result = questionary.text(
+                message,
+                default=prompt_default,
+                instruction=prompt_instruction,
+                **extra_kwargs,
+            ).ask()
             if result is None:
                 raise KeyboardInterrupt
             return (result or "").strip()
         except Exception as e:
             _console_log(f"[Warn] questionary.text 失败，回退到 input: {e}", level="warn")
     prompt = f"{message}"
-    if default:
+    if instruction:
+        prompt += f" ({instruction})"
+    elif default:
         prompt += f" (默认 {default})"
     prompt += ": "
     return input(prompt).strip()
+
+
+def _prompt_positive_int(message: str, default: int) -> int:
+    raw = _prompt_text(
+        message,
+        str(default),
+        instruction=f"直接输入数字，留空默认 {default}",
+        placeholder_default=True,
+    ).strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return default
+
+
+def _prompt_oauth_add_phone_sms(default: bool = False, *, label: str = "OAuth") -> bool:
+    return _prompt_confirm(
+        f"{label} 命中 add_phone 时自动通过短信接码?",
+        default=default,
+    )
 
 
 def _prompt_confirm(message: str, default: bool = True) -> bool:
@@ -758,7 +825,7 @@ PHONE_MAX_ACTIVE = int(_CONFIG.get("phone_max_active") or 0)
 PHONE_ACQUIRE_TIMEOUT = float(_CONFIG.get("phone_acquire_timeout", 60.0))
 PHONE_POOL_LEASE_SECONDS = int(_CONFIG.get("phone_pool_lease_seconds", 60))
 PHONE_POOL_HEARTBEAT_SECONDS = int(_CONFIG.get("phone_pool_heartbeat_seconds", 30))
-RETRY_OAUTH_DEFAULT_WORKERS = 2
+RETRY_OAUTH_DEFAULT_WORKERS = 1
 PHONE_POOL_ENABLED = bool(_CONFIG.get("phone_pool_enabled", True))
 IMAP_PROFILES = _load_imap_profiles(_CONFIG)
 IMAP_PROFILES_BY_KEY = {profile["key"]: profile for profile in IMAP_PROFILES}
@@ -1451,6 +1518,27 @@ def _append_pending_oauth(email: str, password: str, email_pwd: str, mail_provid
                 f.write(f"{email}----{password}----{email_pwd}----{mail_provider or ''}\n")
     except Exception as e:
         _console_log(f"[Warn] 写 pending_oauth.txt 失败: {e}", level="warn")
+
+
+def _finalize_pending_oauth_failure(
+    reg,
+    email: str,
+    password: str,
+    email_pwd: str,
+    mail_provider: str,
+    message: str,
+    *,
+    cause: Exception | None = None,
+):
+    """主注册已成功但 OAuth 未完成时，写入 pending 并按配置决定是否报失败。"""
+    _append_pending_oauth(email, password, email_pwd, mail_provider)
+    if OAUTH_REQUIRED:
+        full_message = f"{message}（oauth_required=true，已记入 pending_oauth.txt）"
+        if cause is not None:
+            raise Exception(full_message) from cause
+        raise Exception(full_message)
+    if reg is not None:
+        reg._print(f"[OAuth] {message}（按配置继续，已记入 pending_oauth.txt）")
 
 
 def _save_codex_tokens(email: str, tokens: dict):
@@ -2288,7 +2376,7 @@ class ChatGPTRegister:
         return: (continue_url, page_type) 或 (None, None) 失败。
         """
         if not self.oauth_add_phone_sms:
-            raise RuntimeError(
+            raise OAuthPendingRequired(
                 "OAuth 流程命中 add_phone，但当前未启用 --oauth-add-phone-sms，默认不会通过 SMS 平台接码"
             )
         pool = _get_phone_pool()
@@ -3643,17 +3731,33 @@ def _register_one(idx, total, proxy, output_file, custom_email=None,
         oauth_ok = True
         if ENABLE_OAUTH:
             reg._print("[OAuth] 开始获取 Codex Token...")
-            tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mail_token=mail_token)
-            oauth_ok = bool(tokens and tokens.get("access_token"))
-            if oauth_ok:
-                _save_codex_tokens(email, tokens)
-                reg._print("[OAuth] Token 已保存")
+            try:
+                tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mail_token=mail_token)
+            except Exception as e:
+                oauth_ok = False
+                _finalize_pending_oauth_failure(
+                    reg,
+                    email,
+                    chatgpt_password,
+                    email_pwd,
+                    mail_provider,
+                    f"OAuth 异常: {e}",
+                    cause=e,
+                )
             else:
-                _append_pending_oauth(email, chatgpt_password, email_pwd, mail_provider)
-                msg = "OAuth 获取失败"
-                if OAUTH_REQUIRED:
-                    raise Exception(f"{msg}（oauth_required=true，已记入 pending_oauth.txt）")
-                reg._print(f"[OAuth] {msg}（按配置继续，已记入 pending_oauth.txt）")
+                oauth_ok = bool(tokens and tokens.get("access_token"))
+                if oauth_ok:
+                    _save_codex_tokens(email, tokens)
+                    reg._print("[OAuth] Token 已保存")
+                else:
+                    _finalize_pending_oauth_failure(
+                        reg,
+                        email,
+                        chatgpt_password,
+                        email_pwd,
+                        mail_provider,
+                        "OAuth 获取失败",
+                    )
 
         # 4. 线程安全写入结果
         with _file_lock:
@@ -3759,6 +3863,16 @@ def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, prox
                     account=_mask_email(email), step="done")
         return True, email, None
 
+    except OAuthPendingRequired as e:
+        msg = str(e)
+        reg._print(f"[Retry] {msg}，保留在 pending_oauth.txt")
+        _worker_log(
+            f"[Retry] [{email}] {msg}，已保留 pending",
+            level="warn",
+            account=_mask_email(email),
+            step="retry_oauth",
+        )
+        return False, email, "pending_oauth"
     except Exception as e:
         msg = str(e)
         _worker_log(f"[FAIL] [{email}] retry 异常: {msg}", level="error",
@@ -3933,8 +4047,8 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
     _system_log(f"{'#'*60}\n", level="success" if success_emails else "warn")
 
 
-def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
-              max_workers=3, proxy=None, custom_email=None,
+def run_batch(total_accounts: int = 1, output_file="registered_accounts.txt",
+              max_workers=1, proxy=None, custom_email=None,
               mail_provider="duckmail", *, with_monitor_runtime=True):
     """并发批量注册
     mail_provider: "duckmail" | "custom" | "source:<key>"
@@ -4178,7 +4292,7 @@ def _add_oauth_add_phone_flags(parser):
         dest="oauth_add_phone_sms",
         action="store_const",
         const=False,
-        help="禁用 OAuth add_phone 自动接码；命中 add_phone 直接报错（默认）",
+        help="禁用 OAuth add_phone 自动接码；命中 add_phone 时写入 pending_oauth.txt（默认）",
     )
     parser.set_defaults(oauth_add_phone_sms=None)
 
@@ -4315,7 +4429,7 @@ def _indent_help_block(text: str, prefix: str = "  ") -> str:
 
 def _print_root_help():
     text = "\n".join([
-        "ChatGPT 批量自动注册工具",
+        _banner_text(),
         "",
         "总用法:",
         "  python3 chatgpt_register.py [register options]",
@@ -4325,7 +4439,7 @@ def _print_root_help():
         "说明:",
         "  默认模式是批量注册。",
         "  如果 OAuth 流程命中 add_phone，默认不会调用 SMS 平台，",
-        "  需要显式传 --oauth-add-phone-sms 才会自动接码。",
+        "  会记入 pending_oauth.txt；显式传 --oauth-add-phone-sms 才会自动接码。",
         "",
         "注册模式参数:",
         _indent_help_block(_build_register_arg_parser().format_help()),
@@ -4502,12 +4616,13 @@ def main():
             max_workers = cli_args.workers or RETRY_OAUTH_DEFAULT_WORKERS
             mp_override = (cli_args.mail_provider or "").strip()
             workers_explicit = cli_args.workers is not None
-            if _is_interactive() and not workers_explicit:
-                workers_input = _prompt_text("OAuth 补救并发数", str(RETRY_OAUTH_DEFAULT_WORKERS)).strip()
-                if workers_input.isdigit() and int(workers_input) > 0:
-                    max_workers = int(workers_input)
-                else:
-                    max_workers = RETRY_OAUTH_DEFAULT_WORKERS
+            interactive = _is_interactive()
+            if interactive and cli_args.oauth_add_phone_sms is None:
+                _set_oauth_add_phone_sms_enabled(
+                    _prompt_oauth_add_phone_sms(OAUTH_ADD_PHONE_SMS, label="Retry OAuth")
+                )
+            if interactive and not workers_explicit:
+                max_workers = _prompt_positive_int("OAuth 补救并发数", RETRY_OAUTH_DEFAULT_WORKERS)
             proxy = cli_args.proxy if cli_args.proxy is not None else DEFAULT_PROXY
             if not proxy:
                 proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
@@ -4533,11 +4648,7 @@ def main():
             "workers": cli_args.workers,
         }
 
-        _console_block([
-            "=" * 60,
-            "  ChatGPT 批量自动注册工具",
-            "=" * 60,
-        ])
+        _print_banner()
 
         interactive = _is_interactive()
         if interactive and questionary is None:
@@ -4585,7 +4696,7 @@ def main():
                     "title": f"{source['name']} | {_describe_email_source(source)}",
                     "value": _source_provider_key(source["key"]),
                 })
-            default_choice = _source_provider_key(DEFAULT_EMAIL_SOURCE_KEY) if DEFAULT_EMAIL_SOURCE_KEY else "duckmail"
+            default_choice = choices[0]["value"] if choices else "duckmail"
             choice = _prompt_select("选择注册邮箱来源", choices, default=default_choice)
             if choice == "custom":
                 mail_provider = "custom"
@@ -4667,16 +4778,18 @@ def main():
             total_accounts = main_args["count"] or DEFAULT_TOTAL_ACCOUNTS
             max_workers = main_args["workers"] or DEFAULT_MAX_WORKERS
         elif interactive:
-            count_input = _prompt_text("注册账号数量", str(DEFAULT_TOTAL_ACCOUNTS)).strip()
-            total_accounts = int(count_input) if count_input.isdigit() and int(count_input) > 0 else DEFAULT_TOTAL_ACCOUNTS
-
-            workers_input = _prompt_text("并发数", str(DEFAULT_MAX_WORKERS)).strip()
-            max_workers = int(workers_input) if workers_input.isdigit() and int(workers_input) > 0 else DEFAULT_MAX_WORKERS
+            total_accounts = _prompt_positive_int("注册账号数量", DEFAULT_TOTAL_ACCOUNTS)
+            max_workers = _prompt_positive_int("并发数", DEFAULT_MAX_WORKERS)
         else:
             total_accounts = DEFAULT_TOTAL_ACCOUNTS
             max_workers = DEFAULT_MAX_WORKERS
             _console_log(f"[Info] 非交互环境，注册数量: {total_accounts}")
             _console_log(f"[Info] 非交互环境，并发数: {max_workers}")
+
+        if ENABLE_OAUTH and interactive and cli_args.oauth_add_phone_sms is None:
+            _set_oauth_add_phone_sms_enabled(
+                _prompt_oauth_add_phone_sms(OAUTH_ADD_PHONE_SMS, label="OAuth")
+            )
 
         if total_accounts <= 1 and not _force_tui:
             _force_no_tui = True

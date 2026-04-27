@@ -1,7 +1,8 @@
 {
   "_comment": "ChatGPT(DuckMail)",
 
-  "total_accounts": 1000,
+  "total_accounts": 1,
+  "max_workers": 1,
 
   "duckmail_api_base": "https://api.duckmail.sbs",
   "duckmail_bearer": "pZM65bD5wxhHkiL",
@@ -35,7 +36,7 @@
       "key": "pandalabs",
       "name": "pandalabs.asia",
       "type": "forward_domain",
-      "domain": "pandalabs.asia",
+      "domain": "team1.pandalabs.asia",
       "receiver": "qq-main"
     },
     {
@@ -97,7 +98,7 @@
   "herosms_api_key": "d90Ab6d6b7367fe5f4f55f31Add39fA0",
   "herosms_country": 52, 
   "herosms_service": "dr",
-  "herosms_max_price": 0.05,
+  "herosms_max_price": 0.0604,
 
   "_comment_phone_pool": "手机号复用池: 一个号最多绑 phone_max_reuse 个 OpenAI 账号, 通过 hero-sms getAllSms 在 activation 窗口内反复收码, 摊薄单号成本",
   "phone_pool_enabled": true,

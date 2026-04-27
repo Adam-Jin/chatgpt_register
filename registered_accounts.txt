@@ -65,3 +65,7 @@ tzy1pii9@anonaddy.me----C@Tmxj0CG0Sr!Q----(addy.io alias→IMAP)----oauth=ok (re
 i6crownw@anonaddy.me----2uR2!Wb%F1ZoVv----(addy.io alias→IMAP)----oauth=ok
 fsf6odbc@anonaddy.me----9$5fTz$gDC&JHD----(addy.io alias→IMAP)----oauth=ok
 j2adgznn@anonaddy.me----Ul9*KF7vjUDzOE----(addy.io alias→IMAP)----oauth=ok
+sean.cole@team1.pandalabs.asia----PH5r$*vUXz@8EU----(forward-domain→IMAP)----oauth=ok (retry)
+j.gibson@team1.pandalabs.asia----&3Rnlf16#xW#pD----(forward-domain→IMAP)----oauth=ok
+ashley.evans62@team1.pandalabs.asia----tdtU@#2Vsn5jo1----(forward-domain→IMAP)----oauth=ok
+kaylap246@team1.pandalabs.asia----Yv1&nWZ*la3*ne----(forward-domain→IMAP)----oauth=ok

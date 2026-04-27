@@ -198,7 +198,7 @@ SKIP_SOLVER_CHECK=1 python3 chatgpt_register.py
 python3 chatgpt_register.py --retry-oauth
 ```
 
-直接执行时默认并发为 `2`。如果是在交互终端里运行且未显式传 `--workers`，程序会先提示一次并发数。
+直接执行时默认并发为 `1`。如果是在交互终端里运行且未显式传 `--workers`，程序会先提示一次并发数。
 
 指定文件或并发数：
 

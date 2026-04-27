@@ -10,7 +10,7 @@ CLI:
   verify              校对 country/service ID (打印 Thailand & OpenAI 候选)
   balance             查余额
   prices              当前 service+country 的报价 + 库存
-  acquire             拿一个号 (默认 fixedPrice=true)
+  acquire             拿一个号 (默认 freePrice=true 走 Free Price 市场)
   wait-otp <id>       轮询 OTP
   cancel <id>         取消 (退款)
   finish <id>         完成 (扣费)
@@ -43,7 +43,7 @@ HEROSMS_API = "https://hero-sms.com/stubs/handler_api.php"
 DEFAULT_COUNTRY = 52       # Thailand (sms-activate 标准, verify 命令可校对)
 DEFAULT_SERVICE = "dr"     # OpenAI/ChatGPT (hero-sms 的 code; 非 sms-activate 标准 "oai")
 DEFAULT_MAX_PRICE = 0.05   # USD
-DEFAULT_FIXED_PRICE = True
+DEFAULT_FREE_PRICE = True   # 走 Free Price 市场 (sms-activate 协议: freePrice=true + maxPrice=X)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
@@ -98,16 +98,22 @@ def get_balance(api_key: str) -> float:
 
 
 def get_prices(api_key: str, service: Optional[str] = None,
-               country: Optional[int] = None) -> dict:
-    """返回嵌套 dict: {country_id: {service_code: {cost,count,physicalCount}}}.
+               country: Optional[int] = None,
+               free_price: bool = True) -> dict:
+    """返回嵌套 dict: {country_id: {service_code: {cost,count,physicalCount[,freePriceMap]}}}.
 
     service/country 都可省略, 省略时返回该维度的全量。
+    free_price=True 时附加 freePrice=true, 响应里 service 节点会多一个
+    freePriceMap (或 freePrice) 字段, 形如 {"0.05": 4, "0.06": 2}, 这才是
+    Free Price 市场上各档真实库存; 不带这个参数只能拿到一个聚合价。
     """
     params: dict = {"action": "getPrices"}
     if service:
         params["service"] = service
     if country is not None:
         params["country"] = country
+    if free_price:
+        params["freePrice"] = "true"
     status, body = _call(api_key, params)
     if status != 200:
         raise SmsProviderError(f"getPrices HTTP {status}: {body!r}")
@@ -118,14 +124,40 @@ def get_prices(api_key: str, service: Optional[str] = None,
     raise SmsProviderError(f"getPrices unexpected: {body!r}")
 
 
+def _iter_free_price_tiers(info: dict):
+    """从 service 节点抠 Free Price 各档. yield (price, count)。
+
+    hero-sms / sms-activate 字段名见过 freePriceMap / freePrice 两种, 兼容一下。
+    """
+    for key in ("freePriceMap", "freePrice"):
+        m = info.get(key)
+        if isinstance(m, dict) and m:
+            for price_str, cnt in m.items():
+                try:
+                    yield float(price_str), int(cnt or 0)
+                except (TypeError, ValueError):
+                    continue
+            return
+
+
 def cheapest_price(prices: dict) -> Optional[tuple[str, float, int]]:
-    """从嵌套 getPrices 返回挑最便宜且有库存的。返回 ("country/service", cost, count)。"""
+    """从嵌套 getPrices 返回挑最便宜且有库存的。返回 ("country/service", cost, count)。
+
+    优先走 freePriceMap 里的最低档 (那才是 getNumberV2 真正会捞到的库存),
+    没有 freePriceMap 才回落到聚合 cost。
+    """
     best: Optional[tuple[str, float, int]] = None
     for c_id, svcs in (prices or {}).items():
         if not isinstance(svcs, dict):
             continue
         for svc_code, info in svcs.items():
             if not isinstance(info, dict):
+                continue
+            tiers = [(p, n) for p, n in _iter_free_price_tiers(info) if n > 0]
+            if tiers:
+                p, n = min(tiers, key=lambda x: x[0])
+                if best is None or p < best[1]:
+                    best = (f"{c_id}/{svc_code}", p, n)
                 continue
             cost = info.get("cost")
             count = info.get("count") or info.get("physicalCount") or 0
@@ -167,17 +199,22 @@ def get_services_list(api_key: str, country: Optional[int] = None,
 
 def get_number_v2(api_key: str, *, service: str, country: int,
                   max_price: Optional[float] = None,
-                  fixed_price: bool = True,
+                  free_price: bool = True,
                   operator: Optional[str] = None,
                   phone_exception: Optional[str] = None,
                   ref: Optional[str] = None) -> dict:
-    """拿号. 没货时抛 NoNumberAvailable, 余额不足/参数错抛 AcquireFailed。"""
+    """拿号. 没货时抛 NoNumberAvailable, 余额不足/参数错抛 AcquireFailed。
+
+    free_price=True (默认) 时附加 freePrice=true, getNumberV2 才会去 Free Price
+    市场捞 ≤ maxPrice 的号 (绝大多数廉价库存都在这个市场上)。
+    free_price=False 仅匹配固定价池 (基本没货, 慎用)。
+    """
     params: dict = {"action": "getNumberV2",
                     "service": service, "country": country}
     if max_price is not None:
         params["maxPrice"] = max_price
-    if fixed_price:
-        params["fixedPrice"] = "true"
+    if free_price:
+        params["freePrice"] = "true"
     if operator:
         params["operator"] = operator
     if phone_exception:
@@ -324,25 +361,25 @@ class HeroSmsProvider(SmsProvider):
         self.default_service = cfg.get("herosms_service", DEFAULT_SERVICE)
         self.default_max_price = float(
             cfg.get("herosms_max_price", DEFAULT_MAX_PRICE))
-        self.default_fixed_price = bool(
-            cfg.get("herosms_fixed_price", DEFAULT_FIXED_PRICE))
+        self.default_free_price = bool(
+            cfg.get("herosms_free_price", DEFAULT_FREE_PRICE))
 
     # ---- SmsProvider 接口 ----
 
     def acquire(self, *, country: Optional[int] = None,
                 service: Optional[str] = None,
                 max_price: Optional[float] = None,
-                fixed_price: Optional[bool] = None,
+                free_price: Optional[bool] = None,
                 operator: Optional[str] = None,
                 phone_exception: Optional[str] = None,
                 **_) -> SmsSession:
         c = int(country) if country is not None else self.default_country
         s = service or self.default_service
         mp = self.default_max_price if max_price is None else float(max_price)
-        fp = self.default_fixed_price if fixed_price is None else bool(fixed_price)
+        fp = self.default_free_price if free_price is None else bool(free_price)
         try:
             info = get_number_v2(self.api_key, service=s, country=c,
-                                 max_price=mp, fixed_price=fp,
+                                 max_price=mp, free_price=fp,
                                  operator=operator,
                                  phone_exception=phone_exception)
         except NoNumberAvailable:
@@ -357,10 +394,14 @@ class HeroSmsProvider(SmsProvider):
                 route, cost, cnt = best
                 hint = (f"; getPrices 当前最低报价 ${_format_price(cost)} "
                         f"(route={route}, 库存={cnt})")
-                if abs(cost - mp) <= 1e-6:
+                if cost > mp + 1e-6:
+                    hint += "; 报价高于 max_price, 建议提高 max_price 或换 country/service"
+                elif abs(cost - mp) <= 1e-6:
                     hint += ("; 这是贴边价, getPrices 与 getNumberV2 可能因"
                              "瞬时库存或更高精度报价不一致")
-                hint += "; 建议提高 max_price 或换 country/service"
+                else:
+                    hint += ("; 报价 ≤ max_price 但 getNumberV2 仍判无货, "
+                             "通常是瞬时被别人抢走或 free_price=False, 重试或确认开启 free_price")
             else:
                 hint = "; getPrices 也没拿到任何报价, 建议换 country/service"
             raise NoNumberAvailable(
@@ -535,13 +576,13 @@ def cmd_prices(args, cfg):
         country = args.country
     else:
         country = int(cfg.get("herosms_country", DEFAULT_COUNTRY))
-    prices = get_prices(api_key, service, country)
+    prices = get_prices(api_key, service, country, free_price=not args.no_free_price)
     if args.json:
         print(json.dumps(prices, ensure_ascii=False, indent=2))
         return
 
-    # 把嵌套 {country: {service: info}} 拍平
-    rows: list[tuple[str, str, float, int, int]] = []
+    # 把嵌套 {country: {service: info}} 拍平; tier=='*' 是聚合行, 其它是 freePriceMap 各档
+    rows: list[tuple[str, str, str, float, int, int]] = []
     for c_id, svcs in prices.items():
         if not isinstance(svcs, dict):
             continue
@@ -549,19 +590,23 @@ def cmd_prices(args, cfg):
             if not isinstance(info, dict):
                 continue
             rows.append((
-                str(c_id), str(svc_code),
+                str(c_id), str(svc_code), "*",
                 float(info.get("cost") or 0),
                 int(info.get("count") or 0),
                 int(info.get("physicalCount") or 0),
             ))
-    # 仅显示有库存的; 无库存的算入但排在底部 (count desc 优先)
-    rows.sort(key=lambda r: (-(1 if (r[3] or r[4]) else 0), r[2], -r[3]))
+            for price, cnt in _iter_free_price_tiers(info):
+                rows.append((str(c_id), str(svc_code), "free",
+                             price, cnt, 0))
+    # 有库存优先; 同 (country, service) 内按 cost 升序
+    rows.sort(key=lambda r: (r[0], r[1], -(1 if (r[4] or r[5]) else 0), r[3]))
 
     print(f"# service={service or 'ALL'} "
-          f"country={country if country is not None else 'ALL'}")
-    print(f"{'country':<8} {'service':<8} {'cost':>8} {'count':>8} {'physical':>10}")
-    for c_id, svc, cost, cnt, phys in rows:
-        print(f"{c_id:<8} {svc:<8} {cost:>8.4f} {cnt:>8} {phys:>10}")
+          f"country={country if country is not None else 'ALL'} "
+          f"freePrice={'on' if not args.no_free_price else 'off'}")
+    print(f"{'country':<8} {'service':<8} {'tier':<6} {'cost':>8} {'count':>8} {'physical':>10}")
+    for c_id, svc, tier, cost, cnt, phys in rows:
+        print(f"{c_id:<8} {svc:<8} {tier:<6} {cost:>8.4f} {cnt:>8} {phys:>10}")
     if not rows:
         print("(no prices)")
 
@@ -582,7 +627,7 @@ def cmd_acquire(args, cfg):
         sess = provider.acquire(
             country=args.country, service=args.service,
             max_price=args.max_price,
-            fixed_price=not args.no_fixed_price,
+            free_price=not args.no_free_price,
             operator=args.operator,
         )
     except NoNumberAvailable as e:
@@ -678,6 +723,8 @@ def main():
                    help="拉所有 country (覆盖 --country / config)")
     p.add_argument("--max-price", type=float, default=None,
                    help="高于此值时打 WARN")
+    p.add_argument("--no-free-price", action="store_true",
+                   help="不带 freePrice=true, 只看固定价聚合 (basically 一行)")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("acquire", help="拿一个号")
@@ -685,8 +732,8 @@ def main():
     p.add_argument("--country", type=int)
     p.add_argument("--max-price", type=float, default=None)
     p.add_argument("--operator")
-    p.add_argument("--no-fixed-price", action="store_true",
-                   help="允许接口在没货时用更高价的号 (默认 fixedPrice=true)")
+    p.add_argument("--no-free-price", action="store_true",
+                   help="不去 Free Price 市场, 只匹配固定价池 (基本拿不到号)")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("wait-otp", help="轮询 OTP")
