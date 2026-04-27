@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 addy.io 别名邮箱池
 

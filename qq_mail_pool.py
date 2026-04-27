@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 自有域名 catch-all 邮箱池 (IMAP 邮箱收信)
 

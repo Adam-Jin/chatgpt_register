@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
+
 """
 ChatGPT 批量自动注册工具 (并发版)
 依赖: pip install curl_cffi
 功能: 使用 DuckMail 临时邮箱，并发自动注册 ChatGPT 账号，自动获取 OTP 验证码
 """
 
+import argparse
 import os
 import re
 import uuid
@@ -132,6 +135,9 @@ def _load_config():
         "output_file": "registered_accounts.txt",
         "enable_oauth": True,
         "oauth_required": True,
+        # OAuth 流程命中 add_phone 时，是否允许通过 SMS 平台自动接码。
+        # 默认关闭，避免静默消耗号码；显式开启后才会走 herosms/quackr。
+        "oauth_add_phone_sms": False,
         "oauth_issuer": "https://auth.openai.com",
         "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
         "oauth_redirect_uri": "http://localhost:1455/auth/callback",
@@ -150,6 +156,7 @@ def _load_config():
         "sentinel_solver_channel": "chromium",
         "sentinel_solver_debug": False,
         # 接码 provider: "herosms" (推荐) / "quackr" / "" 关闭
+        # 仅在 oauth_add_phone_sms=true 或 --oauth-add-phone-sms 时使用。
         "sms_provider": "herosms",
         "sms_max_retries": 3,
         "sms_wait_otp_timeout": 120,
@@ -184,6 +191,10 @@ def _load_config():
     config["total_accounts"] = int(os.environ.get("TOTAL_ACCOUNTS", config["total_accounts"]))
     config["enable_oauth"] = os.environ.get("ENABLE_OAUTH", config["enable_oauth"])
     config["oauth_required"] = os.environ.get("OAUTH_REQUIRED", config["oauth_required"])
+    config["oauth_add_phone_sms"] = os.environ.get(
+        "OAUTH_ADD_PHONE_SMS",
+        os.environ.get("OAUTH_ADD_PHONE_VIA_SMS", config["oauth_add_phone_sms"]),
+    )
     config["oauth_issuer"] = os.environ.get("OAUTH_ISSUER", config["oauth_issuer"])
     config["oauth_client_id"] = os.environ.get("OAUTH_CLIENT_ID", config["oauth_client_id"])
     config["oauth_redirect_uri"] = os.environ.get("OAUTH_REDIRECT_URI", config["oauth_redirect_uri"])
@@ -720,6 +731,7 @@ DEFAULT_PROXY = _CONFIG["proxy"]
 DEFAULT_OUTPUT_FILE = _CONFIG["output_file"]
 ENABLE_OAUTH = _as_bool(_CONFIG.get("enable_oauth", True))
 OAUTH_REQUIRED = _as_bool(_CONFIG.get("oauth_required", True))
+OAUTH_ADD_PHONE_SMS = _as_bool(_CONFIG.get("oauth_add_phone_sms", False))
 OAUTH_ISSUER = _CONFIG["oauth_issuer"].rstrip("/")
 OAUTH_CLIENT_ID = _CONFIG["oauth_client_id"]
 OAUTH_REDIRECT_URI = _CONFIG["oauth_redirect_uri"]
@@ -799,6 +811,14 @@ def _set_log_level(level):
     global _CURRENT_LOG_LEVEL, LOG_LEVEL
     _CURRENT_LOG_LEVEL = normalize_log_level(level, default=_CURRENT_LOG_LEVEL)
     LOG_LEVEL = _CURRENT_LOG_LEVEL
+
+
+def _set_oauth_add_phone_sms_enabled(enabled):
+    global OAUTH_ADD_PHONE_SMS
+    if enabled is None:
+        return
+    OAUTH_ADD_PHONE_SMS = bool(enabled)
+    _CONFIG["oauth_add_phone_sms"] = OAUTH_ADD_PHONE_SMS
 
 
 def _worker_log(message, *, level="info", **fields):
@@ -1693,10 +1713,13 @@ class ChatGPTRegister:
     BASE = "https://chatgpt.com"
     AUTH = "https://auth.openai.com"
 
-    def __init__(self, proxy: str = None, tag: str = ""):
+    def __init__(self, proxy: str = None, tag: str = "", oauth_add_phone_sms=None):
         self.tag = tag  # 线程标识，用于日志
         self.account_id = None
         self.email = None
+        self.oauth_add_phone_sms = (
+            OAUTH_ADD_PHONE_SMS if oauth_add_phone_sms is None else bool(oauth_add_phone_sms)
+        )
         self.device_id = str(uuid.uuid4())
         self.auth_session_logging_id = str(uuid.uuid4())
         self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
@@ -2264,6 +2287,10 @@ class ChatGPTRegister:
 
         return: (continue_url, page_type) 或 (None, None) 失败。
         """
+        if not self.oauth_add_phone_sms:
+            raise RuntimeError(
+                "OAuth 流程命中 add_phone，但当前未启用 --oauth-add-phone-sms，默认不会通过 SMS 平台接码"
+            )
         pool = _get_phone_pool()
         if pool is not None:
             return self._handle_add_phone_with_pool(pool)
@@ -4006,11 +4033,13 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     if ENABLE_OAUTH:
         _system_log(f"  OAuth Issuer: {OAUTH_ISSUER}")
         _system_log(f"  OAuth Client: {OAUTH_CLIENT_ID}")
+        _system_log(f"  OAuth add_phone SMS: {'开启' if OAUTH_ADD_PHONE_SMS else '关闭'}")
         _system_log(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
-    _system_log(
-        f"  PhonePool: max_workers={actual_workers} max_active={PHONE_MAX_ACTIVE or actual_workers} "
-        f"max_reuse={PHONE_MAX_REUSE} acquire_timeout={PHONE_ACQUIRE_TIMEOUT}"
-    )
+    if OAUTH_ADD_PHONE_SMS:
+        _system_log(
+            f"  PhonePool: max_workers={actual_workers} max_active={PHONE_MAX_ACTIVE or actual_workers} "
+            f"max_reuse={PHONE_MAX_REUSE} acquire_timeout={PHONE_ACQUIRE_TIMEOUT}"
+        )
     _system_log(f"  输出文件: {output_file}")
     _system_log(f"{'#'*60}\n")
 
@@ -4080,144 +4109,279 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     _system_log(f"{'#'*60}")
 
 
-def _parse_retry_oauth_args(argv):
-    """解析 --retry-oauth [file] [--workers N] [--mail-provider X]
-    返回 (input_file, max_workers, mail_provider_override, workers_explicit)
-    或 None (未启用 retry)。
-    """
-    if "--retry-oauth" not in argv:
-        return None
-    i = argv.index("--retry-oauth")
-    input_file = PENDING_OAUTH_FILE
-    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-        input_file = argv[i + 1]
-    max_workers = RETRY_OAUTH_DEFAULT_WORKERS
-    workers_explicit = False
-    if "--workers" in argv:
-        j = argv.index("--workers")
-        if j + 1 < len(argv):
-            try:
-                max_workers = max(1, int(argv[j + 1]))
-                workers_explicit = True
-            except ValueError:
-                pass
-    mail_provider_override = ""
-    if "--mail-provider" in argv:
-        j = argv.index("--mail-provider")
-        if j + 1 < len(argv):
-            mail_provider_override = argv[j + 1].strip()
-    return input_file, max_workers, mail_provider_override, workers_explicit
+def _positive_int_arg(raw_value: str) -> int:
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid int value: {raw_value!r}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return value
 
 
-def _parse_auth_from_code_args(argv):
-    if "--auth-from-code" not in argv:
-        return None
-
-    args = {
-        "raw_input": "",
-        "code_verifier": "",
-        "email": "",
-        "account_name": "",
-        "upload_cpa": None,
-        "write_token_lines": None,
-    }
-    i = argv.index("--auth-from-code")
-    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-        args["raw_input"] = argv[i + 1].strip()
-
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token == "--code-verifier" and i + 1 < len(argv):
-            args["code_verifier"] = argv[i + 1].strip()
-            i += 2
-            continue
-        if token == "--email" and i + 1 < len(argv):
-            args["email"] = argv[i + 1].strip()
-            i += 2
-            continue
-        if token == "--account-name" and i + 1 < len(argv):
-            args["account_name"] = argv[i + 1].strip()
-            i += 2
-            continue
-        if token == "--upload-cpa":
-            args["upload_cpa"] = True
-            i += 1
-            continue
-        if token == "--no-upload-cpa":
-            args["upload_cpa"] = False
-            i += 1
-            continue
-        if token == "--write-ak-rk":
-            args["write_token_lines"] = True
-            i += 1
-            continue
-        if token == "--no-write-ak-rk":
-            args["write_token_lines"] = False
-            i += 1
-            continue
-        i += 1
-    return args
+def _build_runtime_parent_parser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-p", "--proxy", help="代理地址，例如 http://127.0.0.1:7890")
+    parser.add_argument(
+        "-l",
+        "--log-level",
+        dest="log_level",
+        metavar="LEVEL",
+        help="日志级别: debug / info / success / warn / error",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        dest="log_level",
+        action="store_const",
+        const="debug",
+        help="等价于 --log-level debug",
+    )
+    parser.set_defaults(log_level=None, tui_mode=None)
+    return parser
 
 
-def _parse_main_args(argv):
-    args = {
-        "mail_provider": None,
-        "email": None,
-        "proxy": None,
-        "count": None,
-        "workers": None,
-        "log_level": None,
-        "force_tui": False,
-        "force_no_tui": False,
-    }
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token == "--mail-provider" and i + 1 < len(argv):
-            args["mail_provider"] = argv[i + 1].strip()
-            i += 2
-            continue
-        if token == "--email" and i + 1 < len(argv):
-            args["email"] = argv[i + 1].strip()
-            i += 2
-            continue
-        if token == "--proxy" and i + 1 < len(argv):
-            args["proxy"] = argv[i + 1].strip()
-            i += 2
-            continue
-        if token == "--count" and i + 1 < len(argv):
-            try:
-                args["count"] = max(1, int(argv[i + 1]))
-            except ValueError:
-                pass
-            i += 2
-            continue
-        if token == "--workers" and i + 1 < len(argv):
-            try:
-                args["workers"] = max(1, int(argv[i + 1]))
-            except ValueError:
-                pass
-            i += 2
-            continue
-        if token == "--log-level" and i + 1 < len(argv):
-            args["log_level"] = normalize_log_level(argv[i + 1], default=_CURRENT_LOG_LEVEL)
-            i += 2
-            continue
-        if token == "--debug":
-            args["log_level"] = "debug"
-            i += 1
-            continue
-        if token == "--tui":
-            args["force_tui"] = True
-            i += 1
-            continue
-        if token == "--no-tui":
-            args["force_no_tui"] = True
-            i += 1
-            continue
-        i += 1
-    return args
+def _add_tui_flags(parser, *, visible: bool):
+    tui_help = "强制开启 TUI" if visible else argparse.SUPPRESS
+    no_tui_help = "强制关闭 TUI" if visible else argparse.SUPPRESS
+    parser.add_argument(
+        "-t",
+        "--tui",
+        dest="tui_mode",
+        action="store_const",
+        const=True,
+        help=tui_help,
+    )
+    parser.add_argument(
+        "-T",
+        "--no-tui",
+        dest="tui_mode",
+        action="store_const",
+        const=False,
+        help=no_tui_help,
+    )
+
+
+def _add_oauth_add_phone_flags(parser):
+    parser.add_argument(
+        "-s",
+        "--oauth-add-phone-sms",
+        "--oauth-add-phone-via-sms",
+        dest="oauth_add_phone_sms",
+        action="store_const",
+        const=True,
+        help="允许 OAuth add_phone 时通过 SMS 平台自动接码",
+    )
+    parser.add_argument(
+        "-S",
+        "--no-oauth-add-phone-sms",
+        dest="oauth_add_phone_sms",
+        action="store_const",
+        const=False,
+        help="禁用 OAuth add_phone 自动接码；命中 add_phone 直接报错（默认）",
+    )
+    parser.set_defaults(oauth_add_phone_sms=None)
+
+
+def _build_register_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="python3 chatgpt_register.py",
+        description="默认模式：批量注册 ChatGPT 账号，并按配置执行 Codex OAuth。",
+        formatter_class=argparse.RawTextHelpFormatter,
+        parents=[_build_runtime_parent_parser()],
+    )
+    parser.add_argument(
+        "-m",
+        "--mail-provider",
+        help="注册邮箱来源 key；custom 需配合 --email。",
+    )
+    parser.add_argument(
+        "-e",
+        "--email",
+        help="指定单个邮箱地址；启用后强制单账号、单线程模式。",
+    )
+    parser.add_argument("-c", "--count", type=_positive_int_arg, help="注册账号数量。")
+    parser.add_argument("-w", "--workers", type=_positive_int_arg, help="并发数。")
+    _add_tui_flags(parser, visible=True)
+    _add_oauth_add_phone_flags(parser)
+    parser.epilog = (
+        "示例:\n"
+        "  python3 chatgpt_register.py --count 5 --workers 2\n"
+        "  python3 chatgpt_register.py --mail-provider custom --email you@example.com\n"
+        "  python3 chatgpt_register.py --oauth-add-phone-sms --proxy http://127.0.0.1:7890"
+    )
+    return parser
+
+
+def _build_retry_oauth_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="python3 chatgpt_register.py",
+        description="补救模式：只对 pending_oauth.txt 中账号重试 OAuth。",
+        formatter_class=argparse.RawTextHelpFormatter,
+        parents=[_build_runtime_parent_parser()],
+    )
+    parser.add_argument(
+        "-r",
+        "--retry-oauth",
+        nargs="?",
+        const=PENDING_OAUTH_FILE,
+        metavar="FILE",
+        help=f"待补救文件，省略时默认 {PENDING_OAUTH_FILE}",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=_positive_int_arg,
+        help=f"OAuth 补救并发数；省略时交互输入或默认 {RETRY_OAUTH_DEFAULT_WORKERS}",
+    )
+    parser.add_argument(
+        "-m",
+        "--mail-provider",
+        help="覆盖 pending 文件中记录的收件源。",
+    )
+    _add_tui_flags(parser, visible=False)
+    _add_oauth_add_phone_flags(parser)
+    parser.epilog = (
+        "示例:\n"
+        "  python3 chatgpt_register.py --retry-oauth\n"
+        "  python3 chatgpt_register.py --retry-oauth pending_oauth.txt --workers 3\n"
+        "  python3 chatgpt_register.py --retry-oauth --oauth-add-phone-sms"
+    )
+    return parser
+
+
+def _build_auth_from_code_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="python3 chatgpt_register.py",
+        description="认证文件模式：用 localhost callback URL 或 authorization code 直接换 token。",
+        formatter_class=argparse.RawTextHelpFormatter,
+        parents=[_build_runtime_parent_parser()],
+    )
+    parser.add_argument(
+        "-a",
+        "--auth-from-code",
+        nargs="?",
+        metavar="CALLBACK_OR_CODE",
+        help="localhost 回调地址或 authorization code",
+    )
+    parser.add_argument("-v", "--code-verifier", help="与该 authorization code 匹配的 PKCE code_verifier")
+    parser.add_argument("-e", "--email", help="认证文件中的 email 字段覆盖值")
+    parser.add_argument("-n", "--account-name", help="认证文件文件名提示/账号名")
+    _add_tui_flags(parser, visible=False)
+    parser.add_argument(
+        "-u",
+        "--upload-cpa",
+        dest="upload_cpa",
+        action="store_const",
+        const=True,
+        help="生成认证文件后上传到 CPA",
+    )
+    parser.add_argument(
+        "-U",
+        "--no-upload-cpa",
+        dest="upload_cpa",
+        action="store_const",
+        const=False,
+        help="不要上传到 CPA",
+    )
+    parser.add_argument(
+        "-k",
+        "--write-ak-rk",
+        dest="write_token_lines",
+        action="store_const",
+        const=True,
+        help="同步写入 ak.txt / rk.txt",
+    )
+    parser.add_argument(
+        "-K",
+        "--no-write-ak-rk",
+        dest="write_token_lines",
+        action="store_const",
+        const=False,
+        help="不要写入 ak.txt / rk.txt",
+    )
+    parser.set_defaults(upload_cpa=None, write_token_lines=None)
+    parser.epilog = (
+        "示例:\n"
+        "  python3 chatgpt_register.py --auth-from-code 'http://localhost:1455/auth/callback?code=ac_xxx' --code-verifier xxx\n"
+        "  python3 chatgpt_register.py --auth-from-code ac_xxx --code-verifier xxx --email you@example.com"
+    )
+    return parser
+
+
+def _indent_help_block(text: str, prefix: str = "  ") -> str:
+    return "\n".join((prefix + line) if line else "" for line in text.rstrip().splitlines())
+
+
+def _print_root_help():
+    text = "\n".join([
+        "ChatGPT 批量自动注册工具",
+        "",
+        "总用法:",
+        "  python3 chatgpt_register.py [register options]",
+        "  python3 chatgpt_register.py --retry-oauth [FILE] [retry options]",
+        "  python3 chatgpt_register.py --auth-from-code [CALLBACK_OR_CODE] [auth options]",
+        "",
+        "说明:",
+        "  默认模式是批量注册。",
+        "  如果 OAuth 流程命中 add_phone，默认不会调用 SMS 平台，",
+        "  需要显式传 --oauth-add-phone-sms 才会自动接码。",
+        "",
+        "注册模式参数:",
+        _indent_help_block(_build_register_arg_parser().format_help()),
+        "",
+        "Retry OAuth 模式参数:",
+        _indent_help_block(_build_retry_oauth_arg_parser().format_help()),
+        "",
+        "Auth From Code 模式参数:",
+        _indent_help_block(_build_auth_from_code_arg_parser().format_help()),
+    ])
+    with _print_lock:
+        print(text)
+
+
+def _detect_cli_mode(argv):
+    has_retry = "--retry-oauth" in argv or "-r" in argv
+    has_auth_from_code = "--auth-from-code" in argv or "-a" in argv
+    if has_retry and has_auth_from_code:
+        raise SystemExit("不能同时使用 --retry-oauth 和 --auth-from-code")
+    if has_auth_from_code:
+        return "auth_from_code"
+    if has_retry:
+        return "retry_oauth"
+    return "register"
+
+
+def _parse_cli_args(argv):
+    mode = _detect_cli_mode(argv)
+    if mode == "register" and any(token in ("-h", "--help") for token in argv):
+        _print_root_help()
+        raise SystemExit(0)
+
+    if mode == "auth_from_code":
+        parser = _build_auth_from_code_arg_parser()
+    elif mode == "retry_oauth":
+        parser = _build_retry_oauth_arg_parser()
+    else:
+        parser = _build_register_arg_parser()
+    return mode, parser.parse_args(argv)
+
+
+def _apply_runtime_cli_flags(cli_args):
+    global _force_no_tui, _force_tui
+    if getattr(cli_args, "log_level", None) is not None:
+        _set_log_level(cli_args.log_level)
+
+    tui_mode = getattr(cli_args, "tui_mode", None)
+    if tui_mode is False:
+        _force_no_tui = True
+        os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
+    elif tui_mode is True:
+        _force_tui = True
+        _force_no_tui = False
+        os.environ.pop("CHATGPT_REGISTER_NO_TUI", None)
+
+    _set_oauth_add_phone_sms_enabled(getattr(cli_args, "oauth_add_phone_sms", None))
 
 
 def _run_auth_from_code_flow(auth_args, proxy=None):
@@ -4309,21 +4473,20 @@ def _run_auth_from_code_flow(auth_args, proxy=None):
 
 
 def main():
-    global _force_no_tui, _force_tui
     try:
-        main_args = _parse_main_args(sys.argv[1:])
-        if main_args["log_level"] is not None:
-            _set_log_level(main_args["log_level"])
-        if main_args["force_no_tui"]:
-            _force_no_tui = True
-            os.environ["CHATGPT_REGISTER_NO_TUI"] = "1"
-        if main_args["force_tui"]:
-            _force_tui = True
-            _force_no_tui = False
-            os.environ.pop("CHATGPT_REGISTER_NO_TUI", None)
-        auth_args = _parse_auth_from_code_args(sys.argv[1:])
-        if auth_args is not None:
-            proxy = main_args["proxy"] if main_args["proxy"] is not None else DEFAULT_PROXY
+        mode, cli_args = _parse_cli_args(sys.argv[1:])
+        _apply_runtime_cli_flags(cli_args)
+
+        if mode == "auth_from_code":
+            auth_args = {
+                "raw_input": (cli_args.auth_from_code or "").strip(),
+                "code_verifier": (cli_args.code_verifier or "").strip(),
+                "email": (cli_args.email or "").strip(),
+                "account_name": (cli_args.account_name or "").strip(),
+                "upload_cpa": cli_args.upload_cpa,
+                "write_token_lines": cli_args.write_token_lines,
+            }
+            proxy = cli_args.proxy if cli_args.proxy is not None else DEFAULT_PROXY
             env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
                 or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
             if not proxy and env_proxy:
@@ -4333,20 +4496,22 @@ def main():
             else:
                 _console_log("[AuthFile] 不使用代理")
             sys.exit(_run_auth_from_code_flow(auth_args, proxy=proxy))
-        # CLI: 仅补救 OAuth (跳过整个注册菜单)
-        retry_args = _parse_retry_oauth_args(sys.argv[1:])
-        if retry_args is not None:
-            input_file, max_workers, mp_override, workers_explicit = retry_args
+
+        if mode == "retry_oauth":
+            input_file = cli_args.retry_oauth or PENDING_OAUTH_FILE
+            max_workers = cli_args.workers or RETRY_OAUTH_DEFAULT_WORKERS
+            mp_override = (cli_args.mail_provider or "").strip()
+            workers_explicit = cli_args.workers is not None
             if _is_interactive() and not workers_explicit:
                 workers_input = _prompt_text("OAuth 补救并发数", str(RETRY_OAUTH_DEFAULT_WORKERS)).strip()
                 if workers_input.isdigit() and int(workers_input) > 0:
                     max_workers = int(workers_input)
                 else:
                     max_workers = RETRY_OAUTH_DEFAULT_WORKERS
-            # 代理: 直接用 config / 环境变量, 不交互问
-            proxy = DEFAULT_PROXY or os.environ.get("HTTPS_PROXY") \
-                or os.environ.get("https_proxy") or os.environ.get("ALL_PROXY") \
-                or os.environ.get("all_proxy") or None
+            proxy = cli_args.proxy if cli_args.proxy is not None else DEFAULT_PROXY
+            if not proxy:
+                proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+                    or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy") or None
             if proxy:
                 _console_log(f"[Retry] 使用代理: {proxy}")
             else:
@@ -4359,6 +4524,14 @@ def main():
                 mail_provider_override=mp_override,
             )
             return
+
+        main_args = {
+            "mail_provider": cli_args.mail_provider,
+            "email": cli_args.email,
+            "proxy": cli_args.proxy,
+            "count": cli_args.count,
+            "workers": cli_args.workers,
+        }
 
         _console_block([
             "=" * 60,

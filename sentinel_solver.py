@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 sentinel_solver.py
 独立 HTTP 服务：用真 Chromium 跑 OpenAI sentinel SDK，返回 sentinel token。
