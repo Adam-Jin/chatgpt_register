@@ -1,13 +1,10 @@
 {
   "_comment": "ChatGPT(DuckMail)",
-
   "total_accounts": 1,
   "max_workers": 1,
-
   "duckmail_api_base": "https://api.duckmail.sbs",
   "duckmail_bearer": "pZM65bD5wxhHkiL",
   "default_email_source": "pandalabs",
-
   "_comment_imap_profiles": "纯收件箱配置: 只描述 IMAP 怎么连，不描述注册时用哪个域名/地址",
   "imap_profiles": [
     {
@@ -77,10 +74,8 @@
   "mail_poll_interval": 4,
   "mail_debug": false,
   "qq_imap_folder": "",
-
   "proxy": "",
   "log_level": "info",
-
   "output_file": "registered_accounts.txt",
   "enable_oauth": true,
   "oauth_required": true,
@@ -92,19 +87,49 @@
   "token_json_dir": "codex_tokens",
   "upload_api_url": "https://cpa.tailffc5a.ts.net/v0/management/auth-files",
   "upload_api_token": "v4JhQJ7mnw7f6hR",
-
   "sentinel_solver_url": "http://127.0.0.1:5732",
-
   "herosms_api_key": "d90Ab6d6b7367fe5f4f55f31Add39fA0",
-  "herosms_country": 52, 
+  "herosms_country": 52,
   "herosms_service": "dr",
-  "herosms_max_price": 0.0604,
-
+  "herosms_max_price": 0.0628,
   "_comment_phone_pool": "手机号复用池: 一个号最多绑 phone_max_reuse 个 OpenAI 账号, 通过 hero-sms getAllSms 在 activation 窗口内反复收码, 摊薄单号成本",
   "phone_pool_enabled": true,
   "phone_max_reuse": 3,
   "phone_pool_lease_seconds": 60,
   "phone_pool_heartbeat_seconds": 30,
-
+  "_comment_landbridge": "把 curl_cffi/urllib API 请求挂到 proxychain (浏览器不走). 链路: xray(订阅节点) -> arxlabs gateway. landings 按并发数自动生成, 每个 worker 拼一个独立 username (Sticky 取 sticky_minutes; Rotating 强制 t=1 保 worker 隔离). 启动时若不传 --no-interactive, 会问是否启用 + 是否进入配置向导, Q3-Q7 选完会回写 proxy_user_template.",
+  "landbridge": {
+    "enabled": true,
+    "subscription": {
+      "url": "https://webget.yfjc.xyz/api/v1/client/subscribe?token=da7cf995864cd3872bd217230c49d511",
+      "node_name": "🇯🇵日本-2号-0.1倍率"
+    },
+    "gateway": {
+      "host": "us.arxlabs.io",
+      "port": 443,
+      "account": "wddk1149505",
+      "password": "ednypjjl",
+      "protocol": "http",
+      "tls": false,
+      "sni": "",
+      "skip_cert_verify": false
+    },
+    "proxy_user_template": {
+      "country": "US",
+      "state": "New York",
+      "city": "",
+      "ip_mode": "Sticky",
+      "sticky_minutes": 5
+    },
+    "cliproxy_token": "be43bd3444769a8f0fedd1bebac76393",
+    "xray": {
+      "local_socks_port": 10808,
+      "loglevel": "error"
+    },
+    "server": {
+      "bind": "127.0.0.1",
+      "port": 0
+    }
+  },
   "quackr_refresh_token": "AMf-vBxzdVLHG9GzLXuG8EhmMvL_bUZg4PjH5UZbS4-uJzfBuZbtCLFzZ1RuSmBFDeM5YbgzLKqoQl_gTglco3bVBU6wjTec5WePwzjY89HN4n03MWP1HTMnnXD7PQgUP-yZzq5mEcI9uMiY4hBtDBKLZJRU4qrpGralv9fzJbnKbD1KwvBQ8seksFZff0lTJyXzfODQHGb9ftGhzC_neAoXF5rXADAFm_yiskpKkjHTB9C1eTliyHZew0e0IqQLJpOGmN7AxfuOHCHklKxLgMD5cPvocj3xqHFEU4ziEddHni0f9SCiDqneGJWI0RU3mjJPFJ_D-R6ddM5OGFC7E2_mKhgpoSmosCU8tUBxtSLcNEn1cPoJl6YkijmXxITQxa3cCFOHJ91muR2qCi7CFmXcKD3BBldhv7z2CDCOGLO1HwbVzZmDOLQ"
 }

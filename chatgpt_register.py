@@ -194,6 +194,31 @@ def _load_config():
         "herosms_service": "dr",
         "herosms_max_price": 0.05,
         "herosms_free_price": True,
+        # landbridge: 链 xray(订阅节点) -> arxlabs gateway. landings 按并发数自动生成
+        "landbridge": {
+            "enabled": False,
+            "subscription": {"path": "", "url": "", "node_name": ""},
+            "gateway": {
+                "host": "", "port": 0, "account": "", "password": "",
+                "protocol": "http",
+                "tls": False, "sni": "", "skip_cert_verify": False,
+            },
+            "proxy_user_template": {
+                "country": "Rand",
+                "state": "",
+                "city": "",
+                "ip_mode": "Sticky",
+                "sticky_minutes": 5,
+            },
+            "cliproxy_token": "",
+            "xray": {
+                "local_socks_host": "127.0.0.1",
+                "local_socks_port": 10808,
+                "startup_timeout_seconds": 10,
+                "loglevel": "error",
+            },
+            "server": {"bind": "127.0.0.1", "port": 0, "dial_timeout": 10},
+        },
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -364,6 +389,262 @@ def _prompt_confirm(message: str, default: bool = True) -> bool:
     if not raw:
         return default
     return raw in {"y", "yes", "1", "true"}
+
+
+# ---------------- landbridge 启动向导 ----------------
+
+def _lb_http_post_json(url: str, form: dict, timeout: float = 10.0):
+    import urllib.parse
+    import urllib.request
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en,zh;q=0.9,zh-CN;q=0.8",
+            "Origin": "https://dash.cliproxy.com",
+            "Referer": "https://dash.cliproxy.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/147.0.0.0 Safari/537.36"
+            ),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _lb_fetch_countries(token: str):
+    data = _lb_http_post_json(
+        "https://api.cliproxy.com/v2/country",
+        {"cate": "traffic", "lang": "zh", "token": token},
+    )
+    if data.get("code") != 0:
+        raise RuntimeError(f"cliproxy /v2/country code={data.get('code')} msg={data.get('msg')}")
+    return data.get("data") or []
+
+
+def _lb_fetch_cities(token: str, country: str, state: str):
+    data = _lb_http_post_json(
+        "https://api.cliproxy.com/v1/traffic/city",
+        {"country": country, "state": state, "lang": "zh", "token": token},
+    )
+    if data.get("code") != 0:
+        raise RuntimeError(f"cliproxy /v1/traffic/city code={data.get('code')} msg={data.get('msg')}")
+    return data.get("data") or []
+
+
+def _lb_pick(prompt: str, items, label_fn, value_fn, current_value, *, allow_keep=True):
+    """fuzzy single-select。优先用 InquirerPy (输入即过滤, ↑↓ 选, Enter 确认),
+    没装则回退到编号列表。Enter 保留高亮项 (默认即 current_value)。"""
+    try:
+        from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
+    except ImportError:
+        return _lb_pick_numbered(prompt, items, label_fn, value_fn, current_value, allow_keep=allow_keep)
+
+    # 把当前值置顶, 这样默认高亮就是 current_value, 直接 Enter 即可保留
+    # (注意: fuzzy 的 default= 是预填搜索文本, 不是预选项, 所以不能用)
+    current_label = None
+    ordered = []
+    rest = []
+    for it in items:
+        if value_fn(it) == current_value and current_label is None:
+            current_label = label_fn(it)
+            ordered.append(it)
+        else:
+            rest.append(it)
+    ordered.extend(rest)
+    choices = [Choice(value=value_fn(it), name=label_fn(it)) for it in ordered]
+
+    keep_hint = f"当前: {current_label or current_value or '空'}"
+    try:
+        picked = inquirer.fuzzy(
+            message=prompt,
+            choices=choices,
+            instruction=f"(输入过滤, ↑↓ 选, Enter 确认, Ctrl-C 保留 | {keep_hint})",
+            max_height="60%",
+            border=True,
+            mandatory=False,
+        ).execute()
+    except KeyboardInterrupt:
+        return current_value
+    if picked is None:
+        return current_value
+    return picked
+
+
+def _lb_pick_numbered(prompt: str, items, label_fn, value_fn, current_value, *, allow_keep=True):
+    """编号列表回退实现 (InquirerPy 缺失时使用)。"""
+    current_label = None
+    for it in items:
+        if value_fn(it) == current_value:
+            current_label = label_fn(it)
+            break
+    if allow_keep:
+        suffix = f" (回车=保留 {current_label or current_value or '空'})"
+    else:
+        suffix = ""
+    for idx, it in enumerate(items, start=1):
+        marker = "  *" if value_fn(it) == current_value else "   "
+        print(f"{marker}[{idx}] {label_fn(it)}")
+    raw = input(f"{prompt}{suffix}: ").strip()
+    if not raw:
+        return current_value
+    if raw.isdigit():
+        pick = int(raw)
+        if 1 <= pick <= len(items):
+            return value_fn(items[pick - 1])
+    print(f"  无效输入, 保留 {current_label or current_value or '空'}")
+    return current_value
+
+
+def _landbridge_interactive(no_prompt: bool):
+    """启动时的 landbridge 交互向导。修改 _landbridge 内的 cfg, 必要时持久化。"""
+    if no_prompt:
+        if _landbridge.is_enabled():
+            _console_log("[landbridge] --no-landbridge-prompt: 沿用 config 配置 (enabled=true)")
+        else:
+            _console_log("[landbridge] --no-landbridge-prompt: config.enabled=false, 跳过")
+        return
+
+    cfg = _landbridge.get_cfg()
+    cur_enabled = bool(cfg.get("enabled"))
+    enabled = _prompt_confirm(
+        f"[landbridge] 是否启用? (当前 config: {cur_enabled})",
+        default=cur_enabled,
+    )
+    if enabled != cur_enabled:
+        _landbridge.set_enabled(enabled, persist=True)
+    else:
+        _landbridge.set_enabled(enabled, persist=False)
+    if not enabled:
+        _console_log("[landbridge] 已禁用, 走 config.proxy")
+        return
+
+    if not _prompt_confirm("[landbridge] 进入配置向导?", default=False):
+        _console_log("[landbridge] 沿用 config.proxy_user_template")
+        return
+
+    token = (cfg.get("cliproxy_token") or "").strip()
+    if not token:
+        _console_log("[landbridge] config.landbridge.cliproxy_token 为空, 无法拉取国家/州/城市列表", level="warn")
+        return
+
+    template = dict(cfg.get("proxy_user_template") or {})
+    cur_country = (template.get("country") or "Rand").strip() or "Rand"
+    cur_state = (template.get("state") or "").strip()
+    cur_city = (template.get("city") or "").strip()
+    cur_ip_mode = template.get("ip_mode") or "Sticky"
+    cur_minutes = int(template.get("sticky_minutes") or 5)
+
+    # Q3: 国家
+    try:
+        countries = _lb_fetch_countries(token)
+    except Exception as e:
+        _console_log(f"[landbridge] 拉取国家列表失败: {e}", level="error")
+        return
+
+    print()
+    new_country = _lb_pick(
+        "Q3 国家",
+        countries,
+        lambda c: f"{c.get('zh_name', '')} ({c.get('code', '')})",
+        lambda c: c.get("code", ""),
+        cur_country,
+    )
+
+    # Q4: 州 (Rand 时跳过)
+    new_state = ""
+    new_city = ""
+    if new_country and new_country != "Rand":
+        states = []
+        for c in countries:
+            if c.get("code") == new_country:
+                states = c.get("States") or []
+                break
+        if states:
+            print()
+            new_state = _lb_pick(
+                "Q4 州 (回车=Random)",
+                [{"state": ""}] + states,
+                lambda s: s.get("state") or "Random",
+                lambda s: s.get("state") or "",
+                cur_state,
+            )
+        # Q5: 城市 (state 为空时跳过)
+        if new_state:
+            try:
+                cities = _lb_fetch_cities(token, new_country, new_state)
+            except Exception as e:
+                _console_log(f"[landbridge] 拉取城市列表失败: {e}", level="warn")
+                cities = []
+            if cities:
+                print()
+                new_city = _lb_pick(
+                    "Q5 城市 (回车=Random)",
+                    [{"city": ""}] + cities,
+                    lambda c: c.get("city") or "Random",
+                    lambda c: c.get("city") or "",
+                    cur_city,
+                )
+
+    # Q6: 会话类型
+    print()
+    new_ip_mode = _lb_pick(
+        "Q6 会话类型",
+        [{"v": "Sticky"}, {"v": "Rotating"}],
+        lambda x: x["v"],
+        lambda x: x["v"],
+        cur_ip_mode,
+    )
+
+    # Q7: 仅 Sticky 问时长
+    new_minutes = cur_minutes
+    if new_ip_mode == "Sticky":
+        raw = input(f"Q7 Sticky 时长分钟 (1-120, 回车=保留 {cur_minutes}): ").strip()
+        if raw:
+            try:
+                v = int(raw)
+                if 1 <= v <= 120:
+                    new_minutes = v
+                else:
+                    print(f"  超出范围, 保留 {cur_minutes}")
+            except ValueError:
+                print(f"  无效, 保留 {cur_minutes}")
+
+    overrides = {
+        "country": new_country,
+        "state": new_state,
+        "city": new_city,
+        "ip_mode": new_ip_mode,
+        "sticky_minutes": new_minutes,
+    }
+    _landbridge.apply_overrides(overrides)
+
+    # Q8: 预览 + 确认
+    gw = cfg.get("gateway") or {}
+    account = gw.get("account", "")
+    print()
+    print(f"[landbridge] 预览 username 模板:")
+    parts = [account]
+    if new_country: parts.append(f"-region-{new_country}")
+    if new_state:   parts.append(f"-st-{new_state}")
+    if new_city:    parts.append(f"-city-{new_city}")
+    t = new_minutes if new_ip_mode == "Sticky" else 1
+    print(f"  {''.join(parts)}-sid-<8位随机>-t-{t}")
+    print(f"  gateway: {gw.get('host')}:{gw.get('port')} ({gw.get('protocol', 'http')})")
+    print(f"  ip_mode: {new_ip_mode}, t={t} 分钟")
+
+    if _prompt_confirm("Q8 确认并保存到 config.json?", default=True):
+        _landbridge.persist_to_config()
+        _console_log("[landbridge] 已保存到 config.json")
+    else:
+        _console_log("[landbridge] 未保存; 本次运行仍按以上配置生效")
 
 
 def _normalize_imap_profile(raw, fallback_key="default"):
@@ -795,6 +1076,10 @@ DUCKMAIL_API_BASE = _CONFIG["duckmail_api_base"]
 DUCKMAIL_BEARER = _CONFIG["duckmail_bearer"]
 DEFAULT_TOTAL_ACCOUNTS = _CONFIG["total_accounts"]
 DEFAULT_PROXY = _CONFIG["proxy"]
+LANDBRIDGE_CFG = _CONFIG.get("landbridge") or {}
+LANDBRIDGE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+import landbridge_runtime as _landbridge
+_landbridge.configure(LANDBRIDGE_CFG, LANDBRIDGE_CONFIG_PATH)
 DEFAULT_OUTPUT_FILE = _CONFIG["output_file"]
 ENABLE_OAUTH = _as_bool(_CONFIG.get("enable_oauth", True))
 OAUTH_REQUIRED = _as_bool(_CONFIG.get("oauth_required", True))
@@ -1599,6 +1884,52 @@ def _generate_password(length=14):
     return "".join(pwd)
 
 
+_EXIT_IP_PROBE_CACHE: dict = {}
+_EXIT_IP_PROBE_LOCK = threading.Lock()
+
+
+def _probe_exit_ip(proxy, timeout: float = 5.0) -> str:
+    """通过 proxy 请求 ipify, 返回出口 IP。失败返回 'ERR(<类型>)'。"""
+    try:
+        request = urllib.request.Request(
+            "https://api.ipify.org?format=json",
+            headers={"User-Agent": "landbridge-probe/1.0"},
+        )
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        else:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            return str(data.get("ip") or "?")
+    except Exception as e:
+        return f"ERR({type(e).__name__})"
+
+
+def _landbridge_exit_ip_banner(api_proxy, browser_proxy, *, tag: str = "") -> None:
+    """启用 landbridge 时, 一次性自检并打印 banner。同一对 (api,browser) 仅探测一次。"""
+    if not api_proxy or api_proxy == browser_proxy:
+        return
+    key = (api_proxy, browser_proxy)
+    with _EXIT_IP_PROBE_LOCK:
+        cached = _EXIT_IP_PROBE_CACHE.get(key)
+        if cached is None:
+            api_ip = _probe_exit_ip(api_proxy)
+            br_ip = _probe_exit_ip(browser_proxy) if browser_proxy else "(none)"
+            if api_ip.startswith("ERR"):
+                verdict = "FAIL"
+            elif api_ip == br_ip:
+                verdict = "BYPASS (api==browser, 链未生效?)"
+            else:
+                verdict = "OK (api 走 landbridge)"
+            cached = f"[landbridge] exit_ip api={api_ip}  browser={br_ip}  {verdict}"
+            _EXIT_IP_PROBE_CACHE[key] = cached
+    prefix = f"[{tag}] " if tag else ""
+    _console_log(f"{prefix}{cached}")
+
+
 def _duckmail_request(method, url, *, headers=None, payload=None, timeout=15, proxy=None):
     req_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -1801,7 +2132,11 @@ class ChatGPTRegister:
     BASE = "https://chatgpt.com"
     AUTH = "https://auth.openai.com"
 
-    def __init__(self, proxy: str = None, tag: str = "", oauth_add_phone_sms=None):
+    def __init__(self, proxy: str = None, tag: str = "", oauth_add_phone_sms=None,
+                 browser_proxy: str = None):
+        """proxy: curl_cffi / urllib API 走的代理 (可能是 landbridge URL)
+        browser_proxy: playwright/sentinel 浏览器走的代理 (永远是原始上游, 不走 landbridge)。
+                       None 时退化为与 proxy 相同 (兼容老调用)。"""
         self.tag = tag  # 线程标识，用于日志
         self.account_id = None
         self.email = None
@@ -1815,6 +2150,7 @@ class ChatGPTRegister:
         self.session = curl_requests.Session(impersonate=self.impersonate)
 
         self.proxy = proxy
+        self.browser_proxy = browser_proxy if browser_proxy is not None else proxy
         if self.proxy:
             self.session.proxies = {"http": self.proxy, "https": self.proxy}
 
@@ -1833,6 +2169,8 @@ class ChatGPTRegister:
 
         self.session.cookies.set("oai-did", self.device_id, domain="chatgpt.com")
         self._callback_url = None
+
+        _landbridge_exit_ip_banner(self.proxy, self.browser_proxy, tag=self.tag)
 
     def _log(self, step, method, url, status, body=None):
         prefix = f"[{self.tag}] " if self.tag else ""
@@ -2148,7 +2486,7 @@ class ChatGPTRegister:
         headers.update(_make_trace_headers())
 
         sentinel = _request_sentinel_token(
-            "username_password_create", self.device_id, self.ua, proxy=self.proxy,
+            "username_password_create", self.device_id, self.ua, proxy=self.browser_proxy,
         )
         if sentinel:
             headers["openai-sentinel-token"] = sentinel
@@ -2191,7 +2529,7 @@ class ChatGPTRegister:
         headers.update(_make_trace_headers())
 
         sentinel = _request_sentinel_token(
-            "oauth_create_account", self.device_id, self.ua, proxy=self.proxy,
+            "oauth_create_account", self.device_id, self.ua, proxy=self.browser_proxy,
         )
         if sentinel:
             headers["openai-sentinel-token"] = sentinel
@@ -3077,7 +3415,7 @@ class ChatGPTRegister:
 
         def _post_authorize_continue(referer_url: str):
             sentinel_authorize = _request_sentinel_token(
-                "authorize_continue", self.device_id, self.ua, proxy=self.proxy,
+                "authorize_continue", self.device_id, self.ua, proxy=self.browser_proxy,
             )
             if not sentinel_authorize:
                 self._print("[OAuth] authorize_continue 的 sentinel token 获取失败")
@@ -3140,7 +3478,7 @@ class ChatGPTRegister:
 
         self._print("[OAuth] 3/7 POST /api/accounts/password/verify")
         sentinel_pwd = _request_sentinel_token(
-            "password_verify", self.device_id, self.ua, proxy=self.proxy,
+            "password_verify", self.device_id, self.ua, proxy=self.browser_proxy,
         )
         if not sentinel_pwd:
             self._print("[OAuth] password_verify 的 sentinel token 获取失败")
@@ -3637,18 +3975,20 @@ class ChatGPTRegister:
 # ==================== 并发批量注册 ====================
 
 def _register_one(idx, total, proxy, output_file, custom_email=None,
-                  mail_provider="duckmail"):
+                  mail_provider="duckmail", *, browser_proxy=None):
     """单个注册任务 (在线程中运行)
     mail_provider:
       - "duckmail"        : DuckMail 临时邮箱 (默认)
       - "source:<key>"    : 使用 email_sources 中定义的注册来源
       - "custom"          : custom_email 指定邮箱 + 手动 OTP
+    proxy 是 API (curl_cffi/urllib) 走的代理；browser_proxy 是浏览器走的代理
+    (默认与 proxy 一致；landbridge 启用时由调用方覆盖以让浏览器走原始上游)。
     """
     reg = None
     qq_pool = None
     qq_addr = None
     try:
-        reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}")
+        reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}", browser_proxy=browser_proxy)
         mail_provider = _normalize_mail_provider(mail_provider)
         source = _get_email_source_for_provider(mail_provider)
 
@@ -3824,12 +4164,14 @@ def _rewrite_pending_oauth(path: str, remaining_raw_lines):
                 f.write(line + "\n")
 
 
-def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, proxy, qq_pool):
-    """对单个账号只跑 OAuth 流程, 返回 (ok, email, error)。"""
+def _retry_oauth_one(idx, total, email, password, email_pwd, mail_provider, proxy, qq_pool,
+                     *, browser_proxy=None):
+    """对单个账号只跑 OAuth 流程, 返回 (ok, email, error)。
+    proxy 是 API 走的代理；browser_proxy 是浏览器走的代理 (默认与 proxy 一致)。"""
     reg = None
     qq_addr = None
     try:
-        reg = ChatGPTRegister(proxy=proxy, tag=email.split("@")[0])
+        reg = ChatGPTRegister(proxy=proxy, tag=email.split("@")[0], browser_proxy=browser_proxy)
         mail_provider = _normalize_mail_provider(mail_provider)
 
         if _mail_provider_is_imap(mail_provider) and qq_pool:
@@ -3979,8 +4321,22 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
     success_emails = set()
     fail_emails = set()
     worker_slots: queue.Queue[str] = queue.Queue()
-    for i in range(actual_workers):
-        worker_slots.put(f"W{i + 1}")
+    worker_ids = [f"W{i + 1}" for i in range(actual_workers)]
+    for wid in worker_ids:
+        worker_slots.put(wid)
+
+    worker_proxy_map = {}
+    if _landbridge.is_enabled():
+        try:
+            _landbridge.start_for_workers(worker_ids)
+            worker_proxy_map = _landbridge.assign_worker_landings(worker_ids)
+            _system_log(
+                f"  landbridge: 已启用, landings={_landbridge.landing_ids()}, "
+                f"分配={worker_proxy_map}"
+            )
+        except Exception as e:
+            _system_log(f"  landbridge: 启动失败, 回退到原 proxy: {e}", level="error")
+            worker_proxy_map = {}
 
     def _job(args):
         i, (email, password, email_pwd, mp, raw) = args
@@ -3991,8 +4347,10 @@ def retry_oauth_only(input_file: str = PENDING_OAUTH_FILE,
         if monitor is not None:
             monitor.set_current_worker(worker_id)
         try:
+            api_proxy = worker_proxy_map.get(worker_id, proxy)
             ok, em, err = _retry_oauth_one(
-                i + 1, len(items), email, password, email_pwd, effective_mp, proxy, qq_pool
+                i + 1, len(items), email, password, email_pwd, effective_mp, api_proxy, qq_pool,
+                browser_proxy=proxy,
             )
             return ok, em, raw
         finally:
@@ -4161,8 +4519,23 @@ def run_batch(total_accounts: int = 1, output_file="registered_accounts.txt",
     fail_count = 0
     start_time = time.time()
     worker_slots: queue.Queue[str] = queue.Queue()
-    for i in range(actual_workers):
-        worker_slots.put(f"W{i + 1}")
+    worker_ids = [f"W{i + 1}" for i in range(actual_workers)]
+    for wid in worker_ids:
+        worker_slots.put(wid)
+
+    # landbridge: 按当前 worker 数生成 N 个 Landing, 每个 worker 一个 (username 独立)
+    worker_proxy_map = {}
+    if _landbridge.is_enabled():
+        try:
+            _landbridge.start_for_workers(worker_ids)
+            worker_proxy_map = _landbridge.assign_worker_landings(worker_ids)
+            _system_log(
+                f"  landbridge: 已启用, landings={_landbridge.landing_ids()}, "
+                f"分配={worker_proxy_map}"
+            )
+        except Exception as e:
+            _system_log(f"  landbridge: 启动失败, 回退到原 proxy: {e}", level="error")
+            worker_proxy_map = {}
 
     def _worker_job(account_idx):
         worker_id = worker_slots.get()
@@ -4170,9 +4543,11 @@ def run_batch(total_accounts: int = 1, output_file="registered_accounts.txt",
         if monitor is not None:
             monitor.set_current_worker(worker_id)
         try:
+            api_proxy = worker_proxy_map.get(worker_id, proxy)
             return _register_one(
-                account_idx, total_accounts, proxy, output_file,
+                account_idx, total_accounts, api_proxy, output_file,
                 custom_email, mail_provider,
+                browser_proxy=proxy,
             )
         finally:
             if monitor is not None:
@@ -4251,7 +4626,13 @@ def _build_runtime_parent_parser():
         const="debug",
         help="等价于 --log-level debug",
     )
-    parser.set_defaults(log_level=None, tui_mode=None)
+    parser.add_argument(
+        "--no-landbridge-prompt",
+        dest="no_landbridge_prompt",
+        action="store_true",
+        help="跳过 landbridge 启用/配置交互, 直接读 config 中已保存的 enabled + template",
+    )
+    parser.set_defaults(log_level=None, tui_mode=None, no_landbridge_prompt=False)
     return parser
 
 
@@ -4590,6 +4971,16 @@ def main():
     try:
         mode, cli_args = _parse_cli_args(sys.argv[1:])
         _apply_runtime_cli_flags(cli_args)
+
+        # landbridge: 启动向导 (auth_from_code 不走 worker, 跳过)
+        if mode != "auth_from_code":
+            no_lb_prompt = bool(getattr(cli_args, "no_landbridge_prompt", False)) or not _is_interactive()
+            try:
+                _landbridge_interactive(no_lb_prompt)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                _console_log(f"[landbridge] 向导异常, 沿用 config 配置: {e}", level="warn")
 
         if mode == "auth_from_code":
             auth_args = {
