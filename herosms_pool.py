@@ -67,11 +67,19 @@ def _call(api_key: str, params: dict, timeout: int = 20) -> Any:
 
     hero-sms 的响应有时是 JSON, 有时是纯文本 (ACCESS_NUMBER:xx, NO_NUMBERS, ...),
     所以这里返回二者之一供上层判断。
+
+    网络/TLS/curl 错误一律包成 SmsProviderError (transport), 让上层 retry 循环
+    能识别为"暂时性故障"而不是"号码失效"。
     """
     p = {"api_key": api_key, **params}
-    r = http.get(HEROSMS_API, params=p,
-                 headers={"User-Agent": UA, "Accept": "application/json"},
-                 timeout=timeout, impersonate=IMPERSONATE)
+    try:
+        r = http.get(HEROSMS_API, params=p,
+                     headers={"User-Agent": UA, "Accept": "application/json"},
+                     timeout=timeout, impersonate=IMPERSONATE)
+    except Exception as e:
+        # curl_cffi 抛 RequestException / CurlError / SSLError / DNSError 等;
+        # 也兜底任何未知 transport 异常。
+        raise SmsProviderError(f"transport error: {type(e).__name__}: {e}") from e
     body = r.text
     parsed: Any = body
     if body and body[:1] in ("{", "["):

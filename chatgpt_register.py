@@ -169,7 +169,7 @@ def _load_config():
         "ak_file": "ak.txt",
         "rk_file": "rk.txt",
         "max_workers": 1,
-        "tui_enabled": True,
+        "tui_enabled": False,
         "log_level": DEFAULT_LOG_LEVEL,
         "token_json_dir": "codex_tokens",
         "upload_api_url": "",
@@ -1091,7 +1091,7 @@ AK_FILE = _CONFIG["ak_file"]
 RK_FILE = _CONFIG["rk_file"]
 DEFAULT_MAX_WORKERS = _CONFIG["max_workers"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
-TUI_ENABLED = _as_bool(_CONFIG.get("tui_enabled", True))
+TUI_ENABLED = _as_bool(_CONFIG.get("tui_enabled", False))
 LOG_LEVEL = _CURRENT_LOG_LEVEL
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
@@ -2788,6 +2788,7 @@ class ChatGPTRegister:
                 baseline = lease.baseline_sms_ids()
                 self._print(f"[Phone] 等待 SMS, 最多 {SMS_WAIT_OTP_TIMEOUT}s "
                             f"(skip {len(baseline)} 历史 sms_id)")
+                wait_exc = None
                 try:
                     result = provider.wait_otp_with_id(
                         lease.to_session(), timeout=SMS_WAIT_OTP_TIMEOUT,
@@ -2798,6 +2799,7 @@ class ChatGPTRegister:
                     )
                 except Exception as e:
                     self._print(f"[Phone] wait_otp 异常: {e}")
+                    wait_exc = e
                     result = None
 
                 if not result:
@@ -2807,6 +2809,12 @@ class ChatGPTRegister:
                         # (心跳线程已经把 _released=False 但没动 DB)
                         lease._released = True
                         lease.stop_heartbeat()
+                    elif wait_exc is not None:
+                        # poll 循环抛异常 (transport/TLS/网络/未知 bug) → 号本身没问题。
+                        # 不 mark_dead, 还回池子让别的 worker 复用; 当前 worker 换号重试。
+                        self._print(f"[Phone] wait_otp 抛异常, 释放 lease (不 mark_dead) "
+                                    f"留给后续复用")
+                        lease.release_lease_only()
                     else:
                         self._print(f"[Phone] 没收到 SMS, mark_dead")
                         lease.mark_dead(reason="no_otp_2min")
@@ -2883,6 +2891,7 @@ class ChatGPTRegister:
                 continue
 
             self._print(f"[Phone] 等待 SMS, 最多 {SMS_WAIT_OTP_TIMEOUT}s")
+            wait_exc = None
             try:
                 otp = provider.wait_otp(
                     sess, timeout=SMS_WAIT_OTP_TIMEOUT,
@@ -2890,14 +2899,19 @@ class ChatGPTRegister:
                     log=lambda s: self._channel_log("sms", s, step="Phone"))
             except Exception as e:
                 self._print(f"[Phone] wait_otp 异常: {e}")
+                wait_exc = e
                 otp = None
 
             if not otp:
-                self._print(f"[Phone] 没收到 SMS, release_no_sms 换号")
-                try:
-                    provider.release_no_sms(sess)
-                except Exception as e:
-                    self._print(f"[Phone] release_no_sms 异常: {e}")
+                if wait_exc is not None:
+                    # transport/网络异常 → 号没毛病, 别 cancel 烧钱; 让号自然过期/复用
+                    self._print(f"[Phone] wait_otp 抛异常, 不 release_no_sms, 直接换号")
+                else:
+                    self._print(f"[Phone] 没收到 SMS, release_no_sms 换号")
+                    try:
+                        provider.release_no_sms(sess)
+                    except Exception as e:
+                        self._print(f"[Phone] release_no_sms 异常: {e}")
                 continue
 
             self._print(f"[Phone] 收到 OTP={otp}, 提交验证")
@@ -4637,8 +4651,7 @@ def _build_runtime_parent_parser():
 
 
 def _add_tui_flags(parser, *, visible: bool):
-    tui_help = "强制开启 TUI" if visible else argparse.SUPPRESS
-    no_tui_help = "强制关闭 TUI" if visible else argparse.SUPPRESS
+    tui_help = "启用 TUI（默认关闭）" if visible else argparse.SUPPRESS
     parser.add_argument(
         "-t",
         "--tui",
@@ -4653,7 +4666,7 @@ def _add_tui_flags(parser, *, visible: bool):
         dest="tui_mode",
         action="store_const",
         const=False,
-        help=no_tui_help,
+        help=argparse.SUPPRESS,
     )
 
 
@@ -4734,7 +4747,7 @@ def _build_retry_oauth_arg_parser():
         "--mail-provider",
         help="覆盖 pending 文件中记录的收件源。",
     )
-    _add_tui_flags(parser, visible=False)
+    _add_tui_flags(parser, visible=True)
     _add_oauth_add_phone_flags(parser)
     parser.epilog = (
         "示例:\n"

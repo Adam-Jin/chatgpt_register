@@ -1,4 +1,2 @@
-owen.martin31@team1.pandalabs.asia----!Vuk7bQb4PCmxg----(forward-domain→IMAP)----source:pandalabs
-dan.h54@team1.pandalabs.asia----IShD6#Hme0uEgf----(forward-domain→IMAP)----source:pandalabs
-adamjin666+gpt1@gmail.com----&21Ni*Yk#02fi2----(user-provided)----custom
-funvdia@gmail.com----6lDw4I7&0cQwyp----(user-provided)----custom
+george_gibson@dev.pandalabs.asia----8gcN$jsyo!2PMf----(forward-domain→IMAP)----source:pandalabs
+edward_foster30@dev.pandalabs.asia----&nUti8C07#JanX----(forward-domain→IMAP)----source:pandalabs

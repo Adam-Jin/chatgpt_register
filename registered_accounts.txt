@@ -69,3 +69,6 @@ sean.cole@team1.pandalabs.asia----PH5r$*vUXz@8EU----(forward-domain→IMAP)----o
 j.gibson@team1.pandalabs.asia----&3Rnlf16#xW#pD----(forward-domain→IMAP)----oauth=ok
 ashley.evans62@team1.pandalabs.asia----tdtU@#2Vsn5jo1----(forward-domain→IMAP)----oauth=ok
 kaylap246@team1.pandalabs.asia----Yv1&nWZ*la3*ne----(forward-domain→IMAP)----oauth=ok
+andrea.scott@team1.pandalabs.asia----Sx*r@c8$PD0lvw----(forward-domain→IMAP)----oauth=ok (retry)
+alexisgray2000@team1.pandalabs.asia----2enFtORylkYRB&----(forward-domain→IMAP)----oauth=ok
+theresanichols21@dev.pandalabs.asia----9xMb42QpRK&l9p----(forward-domain→IMAP)----oauth=ok

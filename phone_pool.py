@@ -266,7 +266,8 @@ class PhonePool:
 
     # ---------- 公开方法 ----------
 
-    def reconcile(self, finish_expired: bool = True):
+    def reconcile(self, finish_expired: bool = True,
+                  revive_dead: bool = False):
         """启动时调一次: 用 hero-sms getActiveActivations 修正本地表.
 
         判断 "号还能不能收码" 的真相: 比较 now vs estDate (云端真实到期时间).
@@ -277,6 +278,12 @@ class PhonePool:
           - 云端有 + 本地无 → 进程崩过, 补录 (used_count=1)
           - 云端有 + 本地有 → 刷新 end_at / phone_number
           - 云端无 + 本地仍 fresh/reused → 标 expired (云端已自己回收)
+
+        revive_dead=True: 强制把云端还活着的 dead 行翻回 reused (清 dead_reason),
+        用于 transport/no_otp_2min 这类误判 dead 的号。OpenAI 真拒了的号
+        (validate_*/openai_send_*/openai_rejected) 复用没意义, 但既然云端还活着,
+        说明 hero-sms 没回收, 重置后下次 acquire 拿到也会再被 OpenAI 拒, 自动
+        重新 mark_dead, 没有副作用。
         """
         from herosms_pool import get_active_activations, finish_activation
         try:
@@ -318,6 +325,16 @@ class PhonePool:
                              now, est_epoch, 1, "reused", 1))
                         self.log(f"[phone_pool] reconcile +new {aid} {phone} "
                                  f"(estDate={est_date_str})")
+                    elif revive_dead and row["status"] == "dead":
+                        c.execute(
+                            "UPDATE phone_pool SET phone_number=?, status='reused', "
+                            "dead_reason=NULL, can_get_another=1, end_at=?, "
+                            "lease_owner=NULL, lease_until=NULL "
+                            "WHERE activation_id=?",
+                            (phone, est_epoch, aid))
+                        self.log(f"[phone_pool] reconcile REVIVE {aid} {phone} "
+                                 f"dead→reused (estDate={est_date_str})")
+                        cap_changed = True
                     else:
                         c.execute(
                             "UPDATE phone_pool SET phone_number=?, "
@@ -754,7 +771,7 @@ def cmd_list(args, cfg):
 
 def cmd_reconcile(args, cfg):
     pool = _build_pool(cfg)
-    pool.reconcile()
+    pool.reconcile(revive_dead=getattr(args, "revive_dead", False))
     cmd_list(argparse.Namespace(limit=50, json=False), cfg)
 
 
@@ -797,7 +814,9 @@ def main():
     p = sub.add_parser("list", help="本地池快照")
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--json", action="store_true")
-    sub.add_parser("reconcile", help="拉云端列表对账")
+    p = sub.add_parser("reconcile", help="拉云端列表对账")
+    p.add_argument("--revive-dead", action="store_true",
+                   help="把云端还活着的 dead 行强制翻回 reused (清 dead_reason)")
     p = sub.add_parser("prune", help="清掉旧的 finished/dead/expired")
     p.add_argument("--days", type=int, default=7)
     sub.add_parser("stats", help="成本摊销统计")
