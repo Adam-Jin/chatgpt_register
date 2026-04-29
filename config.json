@@ -99,7 +99,7 @@
   "phone_pool_heartbeat_seconds": 30,
   "_comment_landbridge": "把 curl_cffi/urllib API 请求挂到 proxychain (浏览器不走). 链路: xray(订阅节点) -> arxlabs gateway. landings 按并发数自动生成, 每个 worker 拼一个独立 username (Sticky 取 sticky_minutes; Rotating 强制 t=1 保 worker 隔离). 启动时若不传 --no-interactive, 会问是否启用 + 是否进入配置向导, Q3-Q7 选完会回写 proxy_user_template.",
   "landbridge": {
-    "enabled": true,
+    "enabled": false,
     "subscription": {
       "url": "https://webget.yfjc.xyz/api/v1/client/subscribe?token=da7cf995864cd3872bd217230c49d511",
       "node_name": "🇯🇵日本-2号-0.1倍率"
