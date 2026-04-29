@@ -15,7 +15,5 @@
     "cli_proxy_management_url": "http://你的CPA地址/management.html#/oauth",
     "cli_proxy_password": "你的CPA密码",
     "accounts_file": "accounts.txt",
-    "csv_file": "registered_accounts.csv",
-    "ak_file": "ak.txt",
-    "rk_file": "rk.txt"
+    "csv_file": "registered_accounts.csv"
 }

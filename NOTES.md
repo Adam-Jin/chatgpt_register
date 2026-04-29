@@ -56,8 +56,6 @@ DuckMail 临时邮箱 / 用户指定邮箱 ──┐
 
 | 文件 | 内容 |
 |---|---|
-| `ak.txt` | 追加一行 access_token |
-| `rk.txt` | 追加一行 refresh_token |
 | `codex_tokens/<email>.json` | Codex CLI 用的完整凭证 |
 | `registered_accounts.txt` | `email----密码----邮箱密码----oauth=ok/fail` |
 | CPA 面板（可选） | `POST {UPLOAD_API_URL}` 上传 JSON |
@@ -156,7 +154,6 @@ body: {"username":{"value":"<email>","kind":"email"},"screen_hint":"signup"}
 chatgpt_register/
 ├── chatgpt_register.py    主脚本
 ├── config.json            配置（DuckMail bearer / OAuth / 上传 API）
-├── ak.txt / rk.txt        access_token / refresh_token 索引
 ├── codex_tokens/          Codex CLI 用的 JSON（核心产物）
 ├── codex_tokens_bak/      历史备份
 ├── registered_accounts.txt  注册结果摘要

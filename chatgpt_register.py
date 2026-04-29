@@ -166,8 +166,6 @@ def _load_config():
         "oauth_issuer": "https://auth.openai.com",
         "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
         "oauth_redirect_uri": "http://localhost:1455/auth/callback",
-        "ak_file": "ak.txt",
-        "rk_file": "rk.txt",
         "max_workers": 1,
         "tui_enabled": False,
         "log_level": DEFAULT_LOG_LEVEL,
@@ -248,8 +246,6 @@ def _load_config():
     config["oauth_issuer"] = os.environ.get("OAUTH_ISSUER", config["oauth_issuer"])
     config["oauth_client_id"] = os.environ.get("OAUTH_CLIENT_ID", config["oauth_client_id"])
     config["oauth_redirect_uri"] = os.environ.get("OAUTH_REDIRECT_URI", config["oauth_redirect_uri"])
-    config["ak_file"] = os.environ.get("AK_FILE", config["ak_file"])
-    config["rk_file"] = os.environ.get("RK_FILE", config["rk_file"])
     config["max_workers"] = int(os.environ.get("MAX_WORKERS", config["max_workers"]))
     config["token_json_dir"] = os.environ.get("TOKEN_JSON_DIR", config["token_json_dir"])
     config["upload_api_url"] = os.environ.get("UPLOAD_API_URL", config["upload_api_url"])
@@ -1087,8 +1083,6 @@ OAUTH_ADD_PHONE_SMS = _as_bool(_CONFIG.get("oauth_add_phone_sms", False))
 OAUTH_ISSUER = _CONFIG["oauth_issuer"].rstrip("/")
 OAUTH_CLIENT_ID = _CONFIG["oauth_client_id"]
 OAUTH_REDIRECT_URI = _CONFIG["oauth_redirect_uri"]
-AK_FILE = _CONFIG["ak_file"]
-RK_FILE = _CONFIG["rk_file"]
 DEFAULT_MAX_WORKERS = _CONFIG["max_workers"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
 TUI_ENABLED = _as_bool(_CONFIG.get("tui_enabled", False))
@@ -1719,21 +1713,7 @@ def _make_auth_filename(filename_hint: str, fallback_stem: str = "auth"):
 
 
 def _persist_codex_token_data(token_data: dict, filename_hint: str = "",
-                              write_token_lines: bool = True, upload_to_cpa=None):
-    access_token = token_data.get("access_token", "")
-    refresh_token = token_data.get("refresh_token", "")
-
-    if write_token_lines:
-        if access_token:
-            with _file_lock:
-                with open(AK_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"{access_token}\n")
-
-        if refresh_token:
-            with _file_lock:
-                with open(RK_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"{refresh_token}\n")
-
+                              upload_to_cpa=None):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
     os.makedirs(token_dir, exist_ok=True)
@@ -1830,7 +1810,7 @@ def _save_codex_tokens(email: str, tokens: dict):
     token_data = _build_codex_token_data(email, tokens)
     if not token_data:
         return
-    _persist_codex_token_data(token_data, filename_hint=email, write_token_lines=True, upload_to_cpa=None)
+    _persist_codex_token_data(token_data, filename_hint=email, upload_to_cpa=None)
 
 
 def _upload_token_json(filepath):
@@ -4520,7 +4500,7 @@ def run_batch(total_accounts: int = 1, output_file="registered_accounts.txt",
         _system_log(f"  OAuth Issuer: {OAUTH_ISSUER}")
         _system_log(f"  OAuth Client: {OAUTH_CLIENT_ID}")
         _system_log(f"  OAuth add_phone SMS: {'开启' if OAUTH_ADD_PHONE_SMS else '关闭'}")
-        _system_log(f"  Token输出: {TOKEN_JSON_DIR}/, {AK_FILE}, {RK_FILE}")
+        _system_log(f"  Token输出: {TOKEN_JSON_DIR}/")
     if OAUTH_ADD_PHONE_SMS:
         _system_log(
             f"  PhonePool: max_workers={actual_workers} max_active={PHONE_MAX_ACTIVE or actual_workers} "
@@ -4792,23 +4772,7 @@ def _build_auth_from_code_arg_parser():
         const=False,
         help="不要上传到 CPA",
     )
-    parser.add_argument(
-        "-k",
-        "--write-ak-rk",
-        dest="write_token_lines",
-        action="store_const",
-        const=True,
-        help="同步写入 ak.txt / rk.txt",
-    )
-    parser.add_argument(
-        "-K",
-        "--no-write-ak-rk",
-        dest="write_token_lines",
-        action="store_const",
-        const=False,
-        help="不要写入 ak.txt / rk.txt",
-    )
-    parser.set_defaults(upload_cpa=None, write_token_lines=None)
+    parser.set_defaults(upload_cpa=None)
     parser.epilog = (
         "示例:\n"
         "  python3 chatgpt_register.py --auth-from-code 'http://localhost:1455/auth/callback?code=ac_xxx' --code-verifier xxx\n"
@@ -4952,13 +4916,6 @@ def _run_auth_from_code_flow(auth_args, proxy=None):
         _console_log("[AuthFile] 已取消写入", level="warn")
         return 0
 
-    write_token_lines = auth_args.get("write_token_lines")
-    if write_token_lines is None:
-        if interactive:
-            write_token_lines = _prompt_confirm("同步写入 ak.txt / rk.txt ?", default=True)
-        else:
-            write_token_lines = True
-
     upload_cpa = auth_args.get("upload_cpa")
     upload_ready = bool(UPLOAD_API_URL and UPLOAD_API_TOKEN)
     if upload_cpa is None:
@@ -4973,7 +4930,6 @@ def _run_auth_from_code_flow(auth_args, proxy=None):
     token_path = _persist_codex_token_data(
         token_data,
         filename_hint=filename_hint,
-        write_token_lines=write_token_lines,
         upload_to_cpa=upload_cpa,
     )
     _console_log(f"[AuthFile] 认证文件已生成: {token_path}", level="success")
@@ -5002,7 +4958,6 @@ def main():
                 "email": (cli_args.email or "").strip(),
                 "account_name": (cli_args.account_name or "").strip(),
                 "upload_cpa": cli_args.upload_cpa,
-                "write_token_lines": cli_args.write_token_lines,
             }
             proxy = cli_args.proxy if cli_args.proxy is not None else DEFAULT_PROXY
             env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \

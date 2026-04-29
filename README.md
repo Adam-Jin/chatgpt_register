@@ -43,8 +43,6 @@ chatgpt_register/
 ├── data.db                  # 本地池 / 租约 / 状态数据库
 ├── registered_accounts.txt  # 结果摘要
 ├── pending_oauth.txt        # OAuth 失败补跑队列
-├── ak.txt                   # access token 索引
-├── rk.txt                   # refresh token 索引
 └── codex_tokens/            # 每个账号的 token JSON
 ```
 
@@ -89,8 +87,6 @@ pip install -r requirements_solver.txt
 | `oauth_issuer` | OAuth 发行方 |
 | `oauth_client_id` | OAuth client id |
 | `oauth_redirect_uri` | OAuth 回调地址 |
-| `ak_file` | access token 输出文件 |
-| `rk_file` | refresh token 输出文件 |
 | `token_json_dir` | 每账号 JSON 令牌输出目录 |
 | `sentinel_solver_url` | 本地浏览器辅助服务地址 |
 | `sms_provider` | 短信 provider，当前代码支持 `herosms` / `quackr` |
@@ -143,8 +139,6 @@ pip install -r requirements_solver.txt
 - `OAUTH_ISSUER`
 - `OAUTH_CLIENT_ID`
 - `OAUTH_REDIRECT_URI`
-- `AK_FILE`
-- `RK_FILE`
 - `MAX_WORKERS`
 - `TOKEN_JSON_DIR`
 - `UPLOAD_API_URL`
@@ -218,10 +212,6 @@ python3 chatgpt_register.py --retry-oauth pending_oauth.txt --workers 3 --mail-p
   - 账号摘要，包含邮箱、密码、邮箱侧信息以及 OAuth 状态
 - `pending_oauth.txt`
   - 主流程成功但 OAuth 未完成的待补跑条目
-- `ak.txt`
-  - access token 索引
-- `rk.txt`
-  - refresh token 索引
 - `codex_tokens/*.json`
   - 每个账号的完整令牌文件
 - `data.db`

@@ -98,8 +98,6 @@ UPLOAD_API_TOKEN = _config.get("upload_api_token", "")
 # 输出文件
 ACCOUNTS_FILE = _config.get("accounts_file", "accounts.txt")
 CSV_FILE = _config.get("csv_file", "registered_accounts.csv")
-AK_FILE = _config.get("ak_file", "ak.txt")
-RK_FILE = _config.get("rk_file", "rk.txt")
 
 # 并发文件写入锁（多线程共享文件时防止数据竞争）
 _file_lock = threading.Lock()
@@ -2096,18 +2094,10 @@ def upload_token_json(filename):
 
 
 def save_tokens(email, tokens):
-    """保存 tokens 到所有目标（txt + JSON + CPA 上传），线程安全"""
+    """保存 tokens 到 JSON，并按配置上传 CPA。"""
     access_token = tokens.get("access_token", "")
     refresh_token = tokens.get("refresh_token", "")
     id_token = tokens.get("id_token", "")
-
-    with _file_lock:
-        if access_token:
-            with open(AK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{access_token}\n")
-        if refresh_token:
-            with open(RK_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{refresh_token}\n")
 
     if access_token:
         save_token_json(email, access_token, refresh_token, id_token)

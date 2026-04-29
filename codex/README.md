@@ -1,11 +1,10 @@
 # Codex 协议密钥生成工具
 
-> 为 ChatGPT 注册生成 Codex 协议所需的 Access Key 和 Refresh Key
+> 为 ChatGPT 注册生成 Codex 认证 JSON
 
 ## 功能
 
-- 🔑 自动生成 Access Key (ak)
-- 🔄 自动生成 Refresh Key (rk)
+- 生成 Codex 认证 JSON
 - 📤 支持上传到 Codex / CPA 面板
 - ⚡ 支持并发生成
 
@@ -45,8 +44,6 @@ python protocol_keygen.py
 
 ## 输出
 
-- `ak.txt` - Access Keys
-- `rk.txt` - Refresh Keys
 - `registered_accounts.csv` - CSV 格式账号
 
 ## 接入 CPA 面板

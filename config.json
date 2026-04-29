@@ -83,8 +83,6 @@
   "oauth_issuer": "https://auth.openai.com",
   "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
   "oauth_redirect_uri": "http://localhost:1455/auth/callback",
-  "ak_file": "ak.txt",
-  "rk_file": "rk.txt",
   "token_json_dir": "codex_tokens",
   "upload_api_url": "https://cpa.tailffc5a.ts.net/v0/management/auth-files",
   "upload_api_token": "v4JhQJ7mnw7f6hR",
