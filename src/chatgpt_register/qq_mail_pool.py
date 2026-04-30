@@ -37,7 +37,8 @@ from typing import Callable, Optional
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
-from log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
+from .log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
+from . import paths as _paths
 
 
 class _IdleUnsupportedError(RuntimeError):
@@ -968,12 +969,9 @@ def _cli_inspect(cfg, count=5, selected_key=""):
 
 if __name__ == "__main__":
     import json
-    import os
     import sys as _sys
 
-    cfg_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "config.json"
-    )
+    cfg_path = _paths.config_path()
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 

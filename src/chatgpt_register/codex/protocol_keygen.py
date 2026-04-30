@@ -54,19 +54,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import urllib3
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    import urllib3
+except Exception as _requests_import_exc:
+    requests = None
+    HTTPAdapter = None
+    Retry = None
+    urllib3 = None
+    _REQUESTS_IMPORT_ERROR = _requests_import_exc
+else:
+    _REQUESTS_IMPORT_ERROR = None
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from .. import paths as _paths
+
+if urllib3 is not None:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # =================== 配置加载 ===================
 
 def load_config():
     """加载外部配置文件"""
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    config_path = _paths.codex_config_path()
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"config.json 未找到: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
@@ -113,6 +125,8 @@ CHATGPT_BASE = "https://chatgpt.com"
 
 def create_session():
     """创建带重试策略的 HTTP 会话"""
+    if requests is None or HTTPAdapter is None or Retry is None:
+        raise RuntimeError(f"requests/urllib3 依赖不可用: {_REQUESTS_IMPORT_ERROR}")
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)

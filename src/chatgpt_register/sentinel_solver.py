@@ -17,7 +17,8 @@ import uuid
 from typing import Callable, Optional
 
 from patchright.async_api import async_playwright
-from log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
+from .log_config import DEFAULT_LOG_LEVEL, normalize_log_level, should_log
+from . import paths as _paths
 
 try:
     from quart import Quart, jsonify, request
@@ -26,7 +27,7 @@ except Exception:
     jsonify = None
     request = None
 
-from browser_configs import browser_config
+from .browser_configs import browser_config
 
 
 # 直接从 auth.openai.com 入口加载，减少不必要的页面跳转
@@ -168,7 +169,7 @@ def _load_runtime_config():
         "channel": "chromium",
         "log_level": DEFAULT_LOG_LEVEL,
     }
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    config_path = _paths.config_path()
     if os.path.exists(config_path):
         try:
             with open(config_path, "r", encoding="utf-8") as f:

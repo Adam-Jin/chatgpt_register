@@ -4,9 +4,9 @@ import unittest
 
 from textual.widgets import RichLog
 
-from monitor import bus
-from monitor.app import RegisterMonitorApp, VIEW_LOGS, VIEW_POOL, VIEW_WORKERS
-from monitor.widgets import PoolStatsPanel, WorkerListPanel
+from chatgpt_register.monitor import bus
+from chatgpt_register.monitor.app import RegisterMonitorApp, VIEW_LOGS, VIEW_POOL, VIEW_WORKERS
+from chatgpt_register.monitor.widgets import PoolStatsPanel, WorkerListPanel
 
 
 class MonitorAppTests(unittest.IsolatedAsyncioTestCase):

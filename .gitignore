@@ -1,3 +1,12 @@
 .venv
 .venv-solver
 __pycache__
+*.pyc
+*.egg-info/
+.pytest_cache/
+var/
+data.db
+data.db-*
+registered_accounts.txt
+pending_oauth.txt
+codex_tokens/

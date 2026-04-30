@@ -137,9 +137,9 @@ def get_provider(name: str, cfg: dict) -> SmsProvider:
     """按名称构造 provider。lazy import 避免循环。"""
     name = (name or "").lower()
     if name == "quackr":
-        from quackr_pool import QuackrProvider
+        from .quackr_pool import QuackrProvider
         return QuackrProvider(cfg)
     if name in ("herosms", "hero-sms", "hero_sms"):
-        from herosms_pool import HeroSmsProvider
+        from .herosms_pool import HeroSmsProvider
         return HeroSmsProvider(cfg)
     raise ValueError(f"unknown sms provider: {name!r}")

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chatgpt-register"
+version = "0.1.0"
+description = "Authorized authentication-flow testing utilities."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "curl_cffi>=0.7",
+    "InquirerPy>=0.3",
+    "patchright>=1.48",
+    "quart>=0.19",
+    "questionary>=2.0",
+    "requests>=2.31",
+    "rich>=13",
+    "textual>=0.80",
+]
+
+[project.optional-dependencies]
+landbridge = [
+    "proxychain @ git+https://github.com/Adam-Jin/landbridge.git@main#subdirectory=proxychain",
+    "xray-core",
+]
+
+[project.scripts]
+chatgpt-register = "chatgpt_register.cli:main"
+phone-pool = "chatgpt_register.phone_pool:main"
+sentinel-solver = "chatgpt_register.sentinel_solver:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

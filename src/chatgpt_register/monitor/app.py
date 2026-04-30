@@ -448,6 +448,10 @@ class RegisterMonitorApp(App):
                 yield event
 
     def _render_worker_list(self) -> None:
+        with contextlib.suppress(Exception):
+            worker_list = self.query_one("#worker-list", WorkerListPanel)
+        if "worker_list" not in locals():
+            return
         rows = []
         worker_ids = list(self._worker_states.keys())
         if not self._selected_worker_id and worker_ids:
@@ -461,7 +465,7 @@ class RegisterMonitorApp(App):
                 "account": state.account,
                 "elapsed": state.elapsed_seconds(),
             })
-        self.query_one("#worker-list", WorkerListPanel).update_workers(rows, self._selected_worker_id)
+        worker_list.update_workers(rows, self._selected_worker_id)
 
     def _move_worker_selection(self, delta: int) -> None:
         worker_ids = list(self._worker_states.keys())

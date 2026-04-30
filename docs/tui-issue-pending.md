@@ -41,7 +41,7 @@
   → 移除 worker 时同步清/重选。
   10. 多版本 Textual 兼容的 _invoke_log_method — app.py:547-570
   多个签名盲试，全部失败时静默 return，掉日志难以排查。
-  → 在 requirements.txt 钉死 textual 版本，删掉这层魔法。
+  → 在 pyproject.toml 钉死 textual 版本，删掉这层魔法。
   11. StreamCapture.write 丢弃空行 — fallback.py:131-143
   if line.strip() 会忽略空行，但 flush() 时却保留缓冲内容，行为不一致。
   12. int(summary.get("done", status.done)) 容易残留旧值 — app.py:296-303

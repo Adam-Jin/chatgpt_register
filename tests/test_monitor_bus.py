@@ -3,8 +3,8 @@ from __future__ import annotations
 import io
 import unittest
 
-from monitor import bus
-from monitor.fallback import MemoryBufferSubscriber, TextSubscriber
+from chatgpt_register.monitor import bus
+from chatgpt_register.monitor.fallback import MemoryBufferSubscriber, TextSubscriber
 
 
 class MonitorBusTests(unittest.TestCase):

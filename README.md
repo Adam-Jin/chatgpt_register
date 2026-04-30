@@ -12,18 +12,18 @@
 
 ## 当前能力
 
-- 支持主流程入口：[chatgpt_register.py](/home/dev/repos/public-repos/chatgpt_register/chatgpt_register.py)
+- 支持主流程入口：[chatgpt_register.py](/home/dev/repos/public-repos/chatgpt_register/chatgpt_register.py)（兼容 wrapper，实际实现见 [register.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/register.py)）
 - 支持多种邮箱来源
   - DuckMail 临时邮箱
   - 自有域名 catch-all 转发到 QQ IMAP
   - 指定自有邮箱手动收码
-- 支持短信接码抽象层：[sms_provider.py](/home/dev/repos/public-repos/chatgpt_register/sms_provider.py)
+- 支持短信接码抽象层：[sms_provider.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/sms_provider.py)
 - 支持多个短信来源实现
-  - HeroSMS: [herosms_pool.py](/home/dev/repos/public-repos/chatgpt_register/herosms_pool.py)
-  - Quackr: [quackr_pool.py](/home/dev/repos/public-repos/chatgpt_register/quackr_pool.py)
-- 支持手机号复用池与租约管理：[phone_pool.py](/home/dev/repos/public-repos/chatgpt_register/phone_pool.py)
-- 支持 IMAP 收信池与 OTP 提取（兼容 QQ 和其它标准 IMAP SSL 邮箱）：[qq_mail_pool.py](/home/dev/repos/public-repos/chatgpt_register/qq_mail_pool.py)
-- 支持本地浏览器辅助服务：[sentinel_solver.py](/home/dev/repos/public-repos/chatgpt_register/sentinel_solver.py)
+  - HeroSMS: [herosms_pool.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/herosms_pool.py)
+  - Quackr: [quackr_pool.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/quackr_pool.py)
+- 支持手机号复用池与租约管理：[phone_pool.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/phone_pool.py)
+- 支持 IMAP 收信池与 OTP 提取（兼容 QQ 和其它标准 IMAP SSL 邮箱）：[qq_mail_pool.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/qq_mail_pool.py)
+- 支持本地浏览器辅助服务：[sentinel_solver.py](/home/dev/repos/public-repos/chatgpt_register/src/chatgpt_register/sentinel_solver.py)
 - 支持 OAuth 失败后的补跑队列：`pending_oauth.txt`
 - 支持令牌和账号结果输出
 
@@ -32,18 +32,20 @@
 ```text
 chatgpt_register/
 ├── chatgpt_register.py      # 主入口：注册 / 登录仿真 / OAuth 补跑
-├── sentinel_solver.py       # 本地浏览器辅助服务
-├── sms_provider.py          # 短信 provider 抽象
-├── herosms_pool.py          # HeroSMS provider
-├── quackr_pool.py           # Quackr provider
-├── phone_pool.py            # 手机号复用池
-├── qq_mail_pool.py          # IMAP catch-all 收信池
-├── browser_configs.py       # 浏览器指纹配置
-├── config.json              # 运行配置
-├── data.db                  # 本地池 / 租约 / 状态数据库
-├── registered_accounts.txt  # 结果摘要
-├── pending_oauth.txt        # OAuth 失败补跑队列
-└── codex_tokens/            # 每个账号的 token JSON
+├── pyproject.toml           # Python package 元数据
+├── src/
+│   └── chatgpt_register/
+│       ├── register.py      # 主流程实现
+│       ├── paths.py         # config / data / output 路径解析
+│       ├── sms_provider.py  # 短信 provider 抽象
+│       ├── phone_pool.py    # 手机号复用池实现
+│       ├── sentinel_solver.py
+│       ├── monitor/
+│       └── codex/
+├── tests/
+├── docs/
+├── config.json              # 兼容旧路径；可迁移到 var/
+└── var/                     # 新运行态目录（默认写入位置）
 ```
 
 ## 运行前提
@@ -59,21 +61,29 @@ chatgpt_register/
 
 ## 安装依赖
 
-主流程依赖：
+项目依赖统一由 `pyproject.toml` 管理：
 
 ```bash
-pip install curl_cffi
+pip install -e .
 ```
 
-浏览器辅助服务依赖：
+开发时推荐使用 editable install：
 
 ```bash
-pip install -r requirements_solver.txt
+python -m unittest discover -s tests
 ```
 
 ## 配置
 
-主配置文件是 [config.json](/home/dev/repos/public-repos/chatgpt_register/config.json)。
+主配置文件默认仍兼容读取仓库根目录的 [config.json](/home/dev/repos/public-repos/chatgpt_register/config.json)。如果设置 `CHATGPT_REGISTER_CONFIG`，会优先使用该文件；如果设置 `CHATGPT_REGISTER_DATA_DIR`，相对运行产物会解析到这个目录。
+
+没有旧根目录文件时，新运行态默认写入 `var/`：
+
+- `var/config.json`
+- `var/data.db`
+- `var/registered_accounts.txt`
+- `var/pending_oauth.txt`
+- `var/codex_tokens/`
 
 当前实现中比较关键的配置项如下：
 
@@ -152,7 +162,7 @@ pip install -r requirements_solver.txt
 先启动浏览器辅助服务：
 
 ```bash
-python3 sentinel_solver.py --thread 2
+sentinel-solver --thread 2
 ```
 
 再启动主流程：
@@ -208,22 +218,24 @@ python3 chatgpt_register.py --retry-oauth pending_oauth.txt --workers 3 --mail-p
 
 ## 输出产物
 
-- `registered_accounts.txt`
+- `registered_accounts.txt` 或 `var/registered_accounts.txt`
   - 账号摘要，包含邮箱、密码、邮箱侧信息以及 OAuth 状态
-- `pending_oauth.txt`
+- `pending_oauth.txt` 或 `var/pending_oauth.txt`
   - 主流程成功但 OAuth 未完成的待补跑条目
-- `codex_tokens/*.json`
+- `codex_tokens/*.json` 或 `var/codex_tokens/*.json`
   - 每个账号的完整令牌文件
-- `data.db`
+- `data.db` 或 `var/data.db`
   - 本地号码池、租约、短信状态等运行数据
+
+已有根目录运行产物会继续被优先使用，避免升级后读不到旧数据。要强制使用新目录，可以设置 `CHATGPT_REGISTER_DATA_DIR=/path/to/state`。
 
 ## 辅助模块
 
-`herosms_pool.py` 提供 HeroSMS 侧的查询与调试 CLI，例如余额、报价、拿号、收码、完成与取消。
+`src/chatgpt_register/herosms_pool.py` 提供 HeroSMS 侧的查询与调试 CLI，例如余额、报价、拿号、收码、完成与取消。
 
-`quackr_pool.py` 提供 Quackr 号码池维护与 OTP 拉取 CLI，例如刷新号码池、挑号、标记、释放、查看列表。
+`src/chatgpt_register/quackr_pool.py` 提供 Quackr 号码池维护与 OTP 拉取 CLI，例如刷新号码池、挑号、标记、释放、查看列表。
 
-`phone_pool.py` 提供手机号池本地对账、清理、统计与租约管理能力。
+`phone-pool` 提供手机号池本地对账、清理、统计与租约管理能力，实际实现位于 `src/chatgpt_register/phone_pool.py`。
 
 ## 文档更新说明
 
