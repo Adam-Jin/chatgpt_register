@@ -39,7 +39,7 @@
 ## 使用
 
 ```bash
-python protocol_keygen.py
+python -m chatgpt_register.codex.protocol_keygen
 ```
 
 ## 输出

@@ -35,11 +35,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from sms_provider import (
+from .sms_provider import (
     AcquireFailed, NoNumberAvailable, SmsProviderError, SmsSession,
 )
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+from . import paths as _paths
 
 DEFAULT_MAX_REUSE = 3
 DEFAULT_LEASE_SECONDS = 60       # 一次抢占的初始租约
@@ -213,7 +213,7 @@ class PhoneLease:
 
 class PhonePool:
     def __init__(self, provider, *,
-                 db_path: str = DB_PATH,
+                 db_path: Optional[str] = None,
                  max_reuse: int = DEFAULT_MAX_REUSE,
                  max_active: int = 0,
                  acquire_timeout: float = 60.0,
@@ -224,7 +224,7 @@ class PhonePool:
         provider: 必须是 HeroSmsProvider 实例 (其他 provider 没有"复用同号"的 API).
         """
         self.provider = provider
-        self.db_path = db_path
+        self.db_path = db_path if db_path is not None else str(_paths.database_path())
         self.max_reuse = int(max_reuse)
         self.max_active = int(max_active)
         self.acquire_timeout = float(acquire_timeout)
@@ -285,7 +285,7 @@ class PhonePool:
         说明 hero-sms 没回收, 重置后下次 acquire 拿到也会再被 OpenAI 拒, 自动
         重新 mark_dead, 没有副作用。
         """
-        from herosms_pool import get_active_activations, finish_activation
+        from .herosms_pool import get_active_activations, finish_activation
         try:
             remote = get_active_activations(self.provider.api_key)
         except Exception as e:
@@ -682,7 +682,7 @@ class PhonePool:
     @staticmethod
     def _current_worker_id() -> Optional[str]:
         try:
-            from monitor import current_worker_id
+            from .monitor import current_worker_id
 
             return current_worker_id()
         except Exception:
@@ -714,7 +714,7 @@ class PhonePool:
 # ============================================================
 
 def _load_cfg():
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    p = _paths.config_path()
     try:
         with open(p, encoding="utf-8") as f:
             return json.load(f)
@@ -723,7 +723,7 @@ def _load_cfg():
 
 
 def _build_pool(cfg):
-    from herosms_pool import HeroSmsProvider
+    from .herosms_pool import HeroSmsProvider
     provider = HeroSmsProvider(cfg)
     return PhonePool(
         provider,

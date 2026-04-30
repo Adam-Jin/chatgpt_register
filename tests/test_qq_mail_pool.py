@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from qq_mail_pool import QQMailPool, _IdleUnsupportedError
+from chatgpt_register.qq_mail_pool import QQMailPool, _IdleUnsupportedError
 
 
 class QQMailPoolAddressTests(unittest.TestCase):

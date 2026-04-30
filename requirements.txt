@@ -1,7 +1,0 @@
-curl_cffi>=0.7
-textual>=0.80
-InquirerPy>=0.3
-# landbridge (config.json 里 landbridge.enabled=true 才真正启用; 即使 false 也会被 import)
-# 私有仓库, CI 需要 deploy key 或 PAT 注入 SSH/HTTPS 凭据
-proxychain @ git+https://github.com/Adam-Jin/landbridge.git@main#subdirectory=proxychain
-xray-core

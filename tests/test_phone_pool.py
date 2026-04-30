@@ -7,8 +7,8 @@ import time
 import unittest
 from unittest import mock
 
-from phone_pool import PhonePool, PhonePoolCapacityExhausted
-from sms_provider import SmsSession
+from chatgpt_register.phone_pool import PhonePool, PhonePoolCapacityExhausted
+from chatgpt_register.sms_provider import SmsSession
 
 
 class FakeProvider:
@@ -138,7 +138,7 @@ class PhonePoolTests(unittest.TestCase):
             "serviceCode": "oai",
             "estDate": "2000-01-01 00:00:00",
         }]
-        with mock.patch("herosms_pool.get_active_activations", return_value=remote), mock.patch("herosms_pool.finish_activation", return_value=None):
+        with mock.patch("chatgpt_register.herosms_pool.get_active_activations", return_value=remote), mock.patch("chatgpt_register.herosms_pool.finish_activation", return_value=None):
             pool.reconcile()
         thread.join(timeout=1.5)
         self.assertFalse(thread.is_alive())

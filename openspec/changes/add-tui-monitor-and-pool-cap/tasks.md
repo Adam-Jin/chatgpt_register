@@ -1,6 +1,6 @@
 ## 1. Foundation: Event Bus & Fallback
 
-- [x] 1.1 Add `textual>=0.80` to `requirements_solver.txt` (Rich comes transitively); create `requirements.txt` for the main app if missing
+- [x] 1.1 Add `textual>=0.80` to `pyproject.toml` project dependencies
 - [x] 1.2 Create `monitor/` package: `monitor/__init__.py`, `monitor/bus.py`, `monitor/fallback.py`, `monitor/app.py`, `monitor/widgets.py`
 - [x] 1.3 Implement `monitor/bus.py`: `Event` dataclass, `EventBus` singleton with `emit / subscribe / channel / stats`, thread-local `current_worker_id`, non-blocking `put_nowait` + drop counter
 - [x] 1.4 Implement `monitor/fallback.py`: `TextSubscriber` that drains the bus queue and prints `"YYYY-MM-DD HH:MM:SS [LEVEL][channel][Wn] msg"` lines

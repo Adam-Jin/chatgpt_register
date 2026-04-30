@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from log_config import normalize_log_level, should_log
+from chatgpt_register.log_config import normalize_log_level, should_log
 
 
 class LogConfigTests(unittest.TestCase):

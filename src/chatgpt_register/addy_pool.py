@@ -21,7 +21,8 @@ import urllib.error
 import urllib.request
 from typing import Callable, Optional
 
-from qq_mail_pool import QQMailPool, get_pool as _get_qq_mail_pool
+from .qq_mail_pool import QQMailPool, get_pool as _get_qq_mail_pool
+from . import paths as _paths
 
 
 _DEFAULT_BASE_URL = "https://app.addy.io"
@@ -325,10 +326,9 @@ def get_pool(addy_config: dict, imap_pool_config: dict,
 
 # ---- CLI 自检 ----
 if __name__ == "__main__":
-    import os
     import sys
 
-    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    cfg_path = _paths.config_path()
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 

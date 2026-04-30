@@ -28,16 +28,15 @@ from typing import Any, Callable, Optional
 
 from curl_cffi import requests as http
 
-from sms_provider import (
+from .sms_provider import (
     AcquireFailed, NoNumberAvailable, SmsProvider, SmsProviderError, SmsSession,
 )
+from . import paths as _paths
 
 
 class ActivationInactive(SmsProviderError):
     """activation 已 finish/cancel/expired (HTTP 409). 号 dead, 不要再 cancel/finish。"""
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "config.json")
 HEROSMS_API = "https://hero-sms.com/stubs/handler_api.php"
 
 DEFAULT_COUNTRY = 52       # Thailand (sms-activate 标准, verify 命令可校对)
@@ -52,7 +51,7 @@ IMPERSONATE = "chrome146"
 
 def load_config() -> dict:
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(_paths.config_path(), encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}

@@ -19,8 +19,7 @@ import time
 
 from curl_cffi import requests as http
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+from . import paths as _paths
 
 QUACKR_API_KEY = "AIzaSyAxiKk4HSdhNYtVAIA2MFGJ7o2IjNGmAm0"
 QUACKR_TOKEN_URL = f"https://securetoken.googleapis.com/v1/token?key={QUACKR_API_KEY}"
@@ -52,14 +51,14 @@ IMPERSONATE = "chrome146"  # curl_cffi TLS 指纹: 模拟 chrome146, 防 CF 拦
 
 def load_config():
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
+        with open(_paths.config_path(), encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(_paths.database_path(), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -489,7 +488,7 @@ class QuackrProvider:
     name = "quackr"
 
     def __init__(self, cfg):
-        from sms_provider import SmsProviderError
+        from .sms_provider import SmsProviderError
         self.cfg = cfg
         self.refresh_token = cfg.get("quackr_refresh_token") or ""
         self.solver_url = (cfg.get("sentinel_solver_url")
@@ -506,7 +505,7 @@ class QuackrProvider:
 
     def acquire(self, *, locale=None, max_use=1, claim_ttl=600,
                 auto_refresh=True, **_):
-        from sms_provider import NoNumberAvailable, SmsSession
+        from .sms_provider import NoNumberAvailable, SmsSession
         conn = self._db()
         row = pick_number(conn, locale=locale, max_use=max_use,
                           claim_ttl=claim_ttl)
@@ -545,7 +544,7 @@ class QuackrProvider:
     def acquire_with_retry(self, max_retries=3, *, wait_timeout=180,
                            poll_interval=5, regex=r"\b(\d{4,8})\b",
                            log=print, **acquire_kwargs):
-        from sms_provider import SmsProvider as _Base
+        from .sms_provider import SmsProvider as _Base
         return _Base.acquire_with_retry(
             self, max_retries=max_retries, wait_timeout=wait_timeout,
             poll_interval=poll_interval, regex=regex, log=log,

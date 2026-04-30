@@ -41,7 +41,7 @@
   - `phone_pool.py`：新增 `max_active` 字段、`_count_active_locked()`、`acquire_or_reuse` 容量门 + condition 等待、`stats()` 快照；释放路径（`_mark_used`/`_mark_dead`/`reconcile` 标 expired）触发 `notify`
   - `sentinel_solver.py` / `qq_mail_pool.py` / `herosms_pool.py` / `quackr_pool.py` / `sms_provider.py`：注入 `log` 回调（已有 `log` 参数的模块改为默认 `bus.channel("sentinel"/"email"/"sms")`）
   - 新增 `monitor/` 目录：`bus.py`（事件总线）、`app.py`（Textual `App` + widgets）、`fallback.py`（文本前缀输出）、`bridge.py`（worker 线程 ↔ Textual 事件循环桥接）
-- **依赖**：新增 `textual>=0.80`（已 transitively 带 Rich；`requirements_solver.txt` 增加一行）
+- **依赖**：新增 `textual>=0.80` 到 `pyproject.toml` project dependencies
 - **配置**：`config.json` 新增 `phone_max_active`、`tui_enabled` 字段；环境变量新增 `PHONE_MAX_ACTIVE`、`CHATGPT_REGISTER_NO_TUI`
 - **数据库**：`phone_pool` 表无 schema 变更（活跃数从现有 `status` + `end_at` 字段计算）
 - **运行时行为**：开启 TUI 后 stdout 由 Rich 接管；CI / nohup / 重定向到文件场景需依赖 fallback 模式

@@ -1,7 +1,7 @@
 # Codex OAuth 链路速查
 
 记录 ChatGPT/Codex CLI OAuth 注册/登录的完整 HTTP 链路、关键参数、常见踩坑点和修复历史。
-代码主入口: `chatgpt_register.py` 的 `perform_codex_oauth_login_http`
+代码主入口: `src/chatgpt_register/register.py` 的 `perform_codex_oauth_login_http`（根目录 `chatgpt_register.py` 只是兼容 wrapper）
 (`_oauth_submit_workspace_and_org` / `_oauth_follow_for_code` / `_oauth_allow_redirect_extract_code`)。
 
 ---
@@ -140,7 +140,7 @@
                             提取 code → /oauth/token
 ```
 
-实现见 `_oauth_submit_workspace_and_org` (chatgpt_register.py)。
+实现见 `_oauth_submit_workspace_and_org` (`src/chatgpt_register/register.py`)。
 **核心规则: ws_next 是规范 oauth 链路时一定优先 follow,advance 只兜底。**
 
 ---
@@ -200,7 +200,7 @@ HTTP 400 { "error": { "message": "Missing required parameter: 'project_id'." } }
 
 ---
 
-## 5. 关键代码位点 (chatgpt_register.py)
+## 5. 关键代码位点 (`src/chatgpt_register/register.py`)
 
 | 步骤                          | 函数 / 位置                                  |
 |-------------------------------|---------------------------------------------|

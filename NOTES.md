@@ -152,12 +152,13 @@ body: {"username":{"value":"<email>","kind":"email"},"screen_hint":"signup"}
 
 ```
 chatgpt_register/
-├── chatgpt_register.py    主脚本
-├── config.json            配置（DuckMail bearer / OAuth / 上传 API）
-├── codex_tokens/          Codex CLI 用的 JSON（核心产物）
+├── chatgpt_register.py    兼容 wrapper
+├── src/chatgpt_register/  主实现 package
+├── config.json            兼容旧配置路径（也可用 var/config.json）
+├── codex_tokens/          兼容旧 token 目录（也可用 var/codex_tokens/）
 ├── codex_tokens_bak/      历史备份
-├── registered_accounts.txt  注册结果摘要
-└── quackr_watch.py        附带：quackr.io Firestore 文档轮询脚本
+├── registered_accounts.txt  兼容旧注册结果摘要
+└── var/                   新运行态默认目录
 ```
 
 ## 六、运行方式
